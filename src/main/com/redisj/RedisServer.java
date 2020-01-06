@@ -19,6 +19,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.regex.Pattern;
 
 /**
@@ -47,7 +48,7 @@ public class RedisServer {
 
     public RedisServer(int port) {
         this.port = port;
-        databases = new LinkedHashMap<Integer, Database>();
+        databases = new TreeMap<Integer, Database>();
     }
 
     public RedisServer withPersistence(File persDir) {
@@ -247,11 +248,24 @@ public class RedisServer {
         return null!=ageable && (ageable.expires<0 || ageable.expires<now());
     }
 
-    protected void onCommand(int db, String cmd, List<String> args) {
+    protected void onBeforeCommand(int dbNumber, int keyCount, String cmd, List<String> args) {
         synchronized (commandListeners) {
             for (CommandListener l : commandListeners) {
                 try {
-                    l.onCommand(db, cmd, args);
+                    l.onBeforeCommand(dbNumber, keyCount, cmd, args);
+                }
+                catch (Exception e) {
+                    logError(CN + ".onCommand: %s", e.getMessage());
+                }
+            }
+        }
+    }
+
+    protected void onAfterCommand(int dbNumber, int keyCount, String cmd, List<String> args) {
+        synchronized (commandListeners) {
+            for (CommandListener l : commandListeners) {
+                try {
+                    l.onAfterCommand(dbNumber, keyCount, cmd, args);
                 }
                 catch (Exception e) {
                     logError(CN + ".onCommand: %s", e.getMessage());
@@ -427,9 +441,20 @@ public class RedisServer {
                         @SuppressWarnings("unchecked")
                         List<String> args = (List<String>)(Object)list;
 
-                        int db = selectedDb;
-                        onCommand(db, cmd, args);
+                        int num = selectedDb;
+                        if (!commandListeners.isEmpty()) {
+                            Database db = getDb();
+                            int keys = db.size();
+                            onBeforeCommand(num, keys, cmd, args);
+                        }
+
                         dispatchCommand(cmd, args);
+
+                        if (!commandListeners.isEmpty()) {
+                            Database db = getDb();
+                            int keys = db.size();
+                            onAfterCommand(num, keys, cmd, args);
+                        }
                     }
                     catch (RESPException e) {
                         String message = e.getMessage();
@@ -1383,7 +1408,7 @@ public class RedisServer {
             return db;
         }
 
-        public void persist(LinkedHashMap<Integer, Database> databases) throws IOException {
+        public void persist(Map<Integer, Database> databases) throws IOException {
             synchronized (databases) {
 
                 final String info = getInfo();
@@ -1540,7 +1565,9 @@ public class RedisServer {
     }
 
     public interface CommandListener {
-        public void onCommand(int db, String cmd, List<String> args);
+        public void onBeforeCommand(int dbNum, int keyCount, String cmd, List<String> args);
+
+        public void onAfterCommand(int dbNum, int keyCount, String cmd, List<String> args);
 
         public void onServerStarting();
 
@@ -1565,7 +1592,7 @@ public class RedisServer {
     protected long clientBiggestInputBuf;
     protected long blockedClients;
     protected long startTime;
-    protected LinkedHashMap<Integer, Database> databases;
+    protected Map<Integer, Database> databases;
     protected int port;
     protected Persistifier persistifier;
     protected ListenThread listenThread;
