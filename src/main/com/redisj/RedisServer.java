@@ -70,7 +70,6 @@ public class RedisServer {
         synchronized (this) {
 
             this.stopRequested = false;
-            //System.out.println("serveForEver: " + port);
 
             if (null!=listenThread) {
                 listenThread.interrupt();
@@ -105,15 +104,6 @@ public class RedisServer {
             }
             this.stopRequested = false;
 
-        } catch (IOException e) {
-            e.printStackTrace();
-        }
-
-        try {
-            if (null!=persistifier) {
-                persistifier.interrupt();
-                persistifier.persist(databases);
-            }
         } catch (IOException e) {
             e.printStackTrace();
         }
@@ -200,7 +190,6 @@ public class RedisServer {
 
     public void onServerStarting() {
         synchronized (commandListeners) {
-            //System.out.println("onServerStarting: listeners=" + listeners.size());
             for (CommandListener l : commandListeners) {
                 try {
                     l.onServerStarting();
@@ -212,8 +201,41 @@ public class RedisServer {
         }
     }
 
+    public void onFileNotFound(int num, File file) {
+        synchronized (commandListeners) {
+            for (CommandListener l : commandListeners) {
+                try {
+                    l.onFileNotFound(num, file);
+                }
+                catch (Exception e) {
+                    logError(CN + "onFileNotFound. %s", e.getMessage());
+                }
+            }
+        }
+    }
+
     public void onServerStopped(String reason) {
-        //System.out.println("onServerStopped: reason=" + reason + ", listeners=" + listeners.size());
+
+        synchronized (commandListeners) {
+            for (CommandListener l : commandListeners) {
+                try {
+                    l.onServerStopping(reason, databases.size());
+                }
+                catch (Exception e) {
+                    logError(CN + "onServerStopping. %s", e.getMessage());
+                }
+            }
+        }
+
+        try {
+            if (null!=persistifier) {
+                persistifier.interrupt();
+                persistifier.persist(databases);
+            }
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+
         synchronized (commandListeners) {
             for (CommandListener l : commandListeners) {
                 try {
@@ -274,15 +296,30 @@ public class RedisServer {
         }
     }
 
+    protected void onLoaded(int dbNumber, int keyCount, String reason) {
+        synchronized (commandListeners) {
+            for (CommandListener l : commandListeners) {
+                try {
+                    l.onLoaded(dbNumber, keyCount, reason);
+                }
+                catch (Exception e) {
+                    logError(CN + ".onCommand: %s", e.getMessage());
+                }
+            }
+        }
+    }
+
     protected long now() {
         return System.currentTimeMillis();
     }
 
+    protected void logInfo(String format, Object ... args) {
+        String message = String.format(format, args);
+        System.out.println(message);
+    }
+
     protected void logError(String format, Object ... args) {
         String message = String.format(format, args);
-        if (message.contains("Socket is closed")) {
-            System.err.print(CN + format);
-        }
         System.err.println(message);
     }
 
@@ -325,14 +362,11 @@ public class RedisServer {
 
         protected void serve() {
 
-            //System.out.println("start serve " + port);
-
             boolean first = true;
             while (!stopRequested && null!=socket) {
 
                 if (first) {
                     first = false;
-                    //System.out.println("start: onServerStarting() ");
                     onServerStarting();
                 }
 
@@ -361,8 +395,6 @@ public class RedisServer {
                     }
                 }
             }
-
-            //System.out.println("stop serve " + port);
 
             String reason = stopRequested ? "Requested" : isInterrupted() ? "Interrupted" : "Socket closed";
 
@@ -1065,10 +1097,6 @@ public class RedisServer {
             return null==s ? null : Double.parseDouble(s);
         }
 
-        protected void logInfo(String string) {
-            System.out.println(string);
-        }
-
         protected int selectedDb;
         protected RESPReader reader;
         protected RESPWriter writer;
@@ -1307,10 +1335,6 @@ public class RedisServer {
      */
     class Persistifier extends Thread {
 
-        private final String  SUFFIX = ".redisj";
-
-        private volatile boolean stopRequested;
-
         public Persistifier(RedisServer redisServer) {
             this(redisServer, createTempDir());
         }
@@ -1337,7 +1361,6 @@ public class RedisServer {
         public void run() {
 
             final String info = getInfo();
-            //System.out.println(info + ": starting");
 
             while (!this.stopRequested) {
                 // 10 minutes:
@@ -1345,7 +1368,7 @@ public class RedisServer {
 
                 if (!stopRequested) {
                     try {
-                        //System.out.println(info + ": saving databases to " + dir);
+                        logInfo("%s: Persisting databases to disk", info);
                         persist(databases);
                     }
                     catch (Exception e) {
@@ -1354,65 +1377,36 @@ public class RedisServer {
                 }
             }
 
-            System.out.println(info + ": terminating");
+            logInfo("%s: terminating", info);
         }
 
         public Map<Integer, Database> load() throws IOException {
 
-            //final String info = getInfo();
-            //System.out.println(info + ": loading databases from " + dir);
+            logInfo("%s: Loading databases from %s", getInfo(), dir);
 
             Map<Integer, Database> map = new HashMap<Integer, Database>();
             for (int num=0; num<16; num++) {
-                Database db = load(num);
-                if (null!=db) {
-                    map.put(num, db);
+
+                try {
+                    Database db = load(num);
+                    if (null!=db) {
+                        map.put(num, db);
+                        int keyCount = db.size();
+                        onLoaded(num, keyCount, "OK");
+                    }
+                }
+                catch (Exception e) {
+                    onLoaded(num, -1, "EXCEPTION " + e.getMessage());
                 }
             }
             return map;
-        }
-
-        protected Database load(int num) throws IOException {
-            File file = getFileForDb(num);
-            return load(num, file);
-        }
-
-        protected Database load(int num, File file) throws IOException {
-
-            if (!file.isFile()) {
-                //System.out.printf("Not found: %s\n", file);
-                return null;
-            }
-
-            System.out.printf(getInfo() + ": loading: %s\n", file);
-            FileInputStream fis = new FileInputStream(file);
-            RESPReader reader = new RESPReader(fis);
-
-            Database db = new Database(num);
-            boolean done = false;
-            do {
-                String key = reader.readString();
-                if (null==key) {
-                    done = true;
-                }
-                else {
-                    Long   expires = reader.readNumber();
-                    Object value   = reader.readStringOrList();
-                    Ageable a = new Ageable(value, expires);
-                    db.put(key, a);
-                }
-            }
-            while (!done);
-            System.out.printf(getInfo() + ": %s: %d keys\n", file, db.size());
-
-            return db;
         }
 
         public void persist(Map<Integer, Database> databases) throws IOException {
             synchronized (databases) {
 
                 final String info = getInfo();
-                System.out.println(info + ": saving " + databases.size() + " databases");
+                logInfo("%s: saving %d databases", info, databases.size());
 
                 for (Integer num : databases.keySet()) {
                     Database db = databases.get(num);
@@ -1473,15 +1467,53 @@ public class RedisServer {
 
             File dest = getFileForDb(num);
             dest.delete();
-            System.out.println(getInfo() + ": Renaming " + tmp + " -> " + dest);
+            logInfo("%s: renaming %s -> %s", getInfo(), tmp, dest);
             tmp.renameTo(dest);
         }
 
-        private File getFileForDb(int num) {
+        protected Database load(int num) throws IOException {
+            File file = getFileForDb(num);
+            return load(num, file);
+        }
+
+        protected Database load(int num, File file) throws IOException {
+
+            if (!file.isFile()) {
+                onFileNotFound(num, file);
+                return null;
+            }
+
+            logInfo("%s: loading: %s", getInfo(), file);
+            FileInputStream fis = new FileInputStream(file);
+            RESPReader reader = new RESPReader(fis);
+
+            Database db = new Database(num);
+            boolean done = false;
+            do {
+                String key = reader.readString();
+                if (null==key) {
+                    done = true;
+                }
+                else {
+                    Long   expires = reader.readNumber();
+                    Object value   = reader.readStringOrList();
+                    Ageable a = new Ageable(value, expires);
+                    db.put(key, a);
+                }
+            }
+            while (!done);
+            logInfo("%s: loaded: s%s: %d keys", getInfo(), file, db.size());
+
+            return db;
+        }
+
+        protected File getFileForDb(int num) {
             File dest = new File(dir, String.format("db%d%s", num, SUFFIX));
             return dest;
         }
 
+        protected volatile boolean stopRequested;
+        protected final String SUFFIX = ".redisj";
         protected File dir;
         protected RedisServer redisServer;
     }
@@ -1557,21 +1589,55 @@ public class RedisServer {
         Object value;
     }
 
+    public interface CommandListener {
+
+        /**
+         * Called when server started.
+         */
+        public void onServerStarting();
+
+        public void onFileNotFound(int dbNum, File file);
+
+        public void onServerStopping(String reason, int size);
+
+        /**
+         * Called when server was stopped.
+         */
+        public void onServerStopped(String reason);
+
+        /**
+         * Called when database was loaded from persistent storage
+         * @param dbNum Database number
+         * @param keyCount Number of key/value pairs loaded
+         * @param result A string describing loading success or failure.
+         */
+        public void onLoaded(int dbNum, int keyCount, String result);
+
+        /**
+         * Called before command execution.
+         * @param dbNum Currently selected database
+         * @param keyCount Number of key/value pairs before command execution.
+         * @param cmd The command to be executed
+         * @param cmd Command arguments
+         */
+        public void onBeforeCommand(int dbNum, int keyCount, String cmd, List<String> args);
+
+        /**
+         * Called after command execution.
+         * @param dbNum Currently selected database
+         * @param keyCount Number of key/value pairs after command execution.
+         * @param cmd The command that was executed
+         * @param cmd Command arguments
+         */
+        public void onAfterCommand(int dbNum, int keyCount, String cmd, List<String> args);
+
+    }
+
     // TODO: Implement support for ZSet, Hash, Bits, Sets
     class ZSet {
     }
 
     class Hash {
-    }
-
-    public interface CommandListener {
-        public void onBeforeCommand(int dbNum, int keyCount, String cmd, List<String> args);
-
-        public void onAfterCommand(int dbNum, int keyCount, String cmd, List<String> args);
-
-        public void onServerStarting();
-
-        public void onServerStopped(String reason);
     }
 
     protected static final String CRLF_STRING = "\r\n";
@@ -1598,4 +1664,5 @@ public class RedisServer {
     protected ListenThread listenThread;
 
     protected volatile boolean stopRequested;
+
 }
