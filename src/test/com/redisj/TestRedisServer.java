@@ -6,7 +6,9 @@ import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 import java.io.IOException;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 import org.junit.AfterClass;
@@ -19,24 +21,42 @@ import redis.clients.jedis.exceptions.JedisDataException;
 
 public class TestRedisServer {
 
+    protected static int PORT = 7379;
+
     @BeforeClass
     public static void setUpBeforeClass() throws IOException {
-        server2 = new RedisServer(PORT);
-        client = new Jedis("127.0.0.1", 7379, 60*1000);
+        server = new RedisServer(PORT);
+        client = new Jedis("127.0.0.1", PORT, 60*1000);
         boolean background = true;
-        server2.serveForEver(background);
-        server2.waitUntilListening();
+        server.serveForEver(background);
+        server.waitUntilListening();
     }
 
     @AfterClass
     public static void tearDownAfterClass() {
         client.close();
-        server2.stop();
+        if (null!=server) {
+            server.stop();
+        }
     }
 
     @Before
     public void setUp() {
-        server2.flush();
+        if (null!=server) {
+            server.flush();
+        }
+    }
+
+    @Test
+    public void testPing() {
+        String pong = client.ping();
+        assertEquals("PONG", pong);
+    }
+
+    @Test
+    public void testEcho() {
+        String otto = client.echo("Otto");
+        assertEquals("Otto", otto);
     }
 
     @Test
@@ -52,6 +72,24 @@ public class TestRedisServer {
         client.incr("C");
 
         client.save();
+    }
+
+    @Test
+    public void testClient() {
+        // null
+        @SuppressWarnings("unused")
+        String name = client.clientGetname();
+
+        // id=58 addr=127.0.0.1:64327 fd=7 name= age=6 idle=0 flags=N db=1 sub=0 psub=0 multi=-1 qbuf=0 qbuf-free=32768 obl=0 oll=0 omem=0 events=r cmd=client
+        @SuppressWarnings("unused")
+        String list = client.clientList();
+
+        // OK
+        String rc = client.clientSetname("blabla");
+        assertEquals("OK", rc);
+
+        String name2 = client.clientGetname();
+        assertEquals("blabla", name2);
     }
 
     @Test
@@ -124,8 +162,11 @@ public class TestRedisServer {
 
     @Test
     public void testKeys() {
+
         String   rc = client.select(7);
         assertEquals("OK", rc);
+
+        client.flushDB();
 
         client.mset(
                 "x1", "one",
@@ -144,6 +185,8 @@ public class TestRedisServer {
 
     @Test
     public void testType() {
+
+        client.flushDB();
 
         String actualA = client.set("A", "123");
         String actualB = client.set("B", "321");
@@ -209,7 +252,10 @@ public class TestRedisServer {
     public void testIncr() {
 
         final String key = "testIncr";
+        client.del(key);
+
         assertNull(client.get(key));
+
         Long actual1 = client.incr(key);
         Long actual2 = client.incr(key);
         assertEquals((Long)1L, actual1);
@@ -293,9 +339,96 @@ public class TestRedisServer {
         assertNull(actual5);
     }
 
-    private static final int PORT = 7379;
-    private static RedisServer server2;
-    private static Jedis client;
-    //private Database db;
+    @Test
+    public void testHash() {
+        String key = "struct";
 
+        client.del(key);
+
+        client.set(key, "string");
+        try {
+            client.hexists(key, "bla");
+        }
+        catch (Exception e) {
+            String actual = e.getMessage();
+            assertEquals("WRONGTYPE Operation against a key holding the wrong kind of value", actual);
+        }
+
+        client.del(key);
+        boolean e0 = client.hexists(key, "a");
+        assertEquals(false, e0);
+
+        long rc1 = client.hsetnx(key, "a", "1");
+        assertEquals(1, rc1);
+
+        boolean e1 = client.hexists(key, "a");
+        assertEquals(true, e1);
+
+        long rc2 = client.hsetnx(key, "a", "1");
+        assertEquals(0, rc2);
+
+        long rc3 = client.hset(key, "b", "2");
+        assertEquals(1, rc3);
+
+        client.hincrByFloat(key, "a", .5);
+        client.hincrBy(key, "b", 1);
+
+        Map<String, String> all = client.hgetAll(key);
+        assertEquals(2, all.size());
+        assertEquals("1.5", all.get("a"));
+        assertEquals("3", all.get("b"));
+
+        String val1 = client.hget(key, "a");
+        assertEquals("1.5", val1);
+
+        String val2 = client.hget(key, "b");
+        assertEquals("3", val2);
+
+        Set<String> keys = client.hkeys(key);
+        assertEquals(2, keys.size());
+
+        long len = client.hlen(key);
+        assertEquals(2, len);
+
+        Map<String, String> map = new HashMap<String, String>();
+        map.put("c", "X");
+        map.put("d", "Y");
+        String rc = client.hmset(key, map);
+
+        List<String> list = client.hmget(key, "a", "b", "c", "d", "missing");
+        assertEquals(5, list.size());
+        assertEquals("1.5", list.get(0));
+        assertEquals("3",   list.get(1));
+        assertEquals("X",   list.get(2));
+        assertEquals("Y",   list.get(3));
+        assertEquals(null,  list.get(4));
+
+        try {
+            long slen = client.hstrlen(key, "a");
+            assertEquals(3, slen);
+        }
+        catch (JedisDataException e) {
+            System.err.println("WARNING: Redis server does not support HSTRLEN");
+        }
+
+        List<String> vals = client.hvals(key);
+        assertEquals(4, vals.size());
+        assertTrue(vals.contains("1.5"));
+        assertTrue(vals.contains("3"));
+        assertTrue(vals.contains("Y"));
+        assertTrue(vals.contains("X"));
+
+        try {
+            rc = client.get(key);
+            fail("Exception expected");
+        }
+        catch (Exception e) {
+            String actual = e.getMessage();
+            assertEquals("WRONGTYPE Operation against a key holding the wrong kind of value", actual);
+        }
+
+    }
+
+    protected static RedisServer server;
+    protected static Jedis client;
 }
