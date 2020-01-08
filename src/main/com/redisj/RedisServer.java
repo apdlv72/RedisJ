@@ -25,7 +25,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.regex.Pattern;
 
-import com.w2m.snowball.migrate.utils.U;
+import com.redisj.RedisServer.Worker;
 
 /**
  *
@@ -1617,7 +1617,7 @@ public class RedisServer {
 
                 if (!checkMissingKeys(missing)) {
                     String msg = String.format("Failed to save database %d. Wrote %d keys, read %d keys. Missing: %s",
-                            num, keyCount, check.size(), U.toString(missing));
+                            num, keyCount, check.size(), missing);
                     logError("%s", msg);
                     throw new RuntimeException(msg);
                 }

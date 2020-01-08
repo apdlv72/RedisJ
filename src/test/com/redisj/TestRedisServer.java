@@ -36,7 +36,7 @@ public class TestRedisServer {
 
     @Before
     public void setUp() {
-        server2.flushAll();
+        server2.flush();
     }
 
     @Test
