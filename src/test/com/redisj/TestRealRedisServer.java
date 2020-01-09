@@ -1,11 +1,13 @@
 package com.redisj;
 
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.fail;
 
 import java.io.IOException;
 
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
+import org.junit.Test;
 
 import redis.clients.jedis.Jedis;
 
@@ -28,5 +30,22 @@ public class TestRealRedisServer extends TestRedisServer {
     @AfterClass
     public static void tearDownAfterClass() {
         client.close();
+    }
+
+    @Test
+    public void testAuth() {
+        String rc = client.auth("password");
+        assertEquals("OK", rc);
+    }
+
+    @Test
+    public void testQuit() {
+        String rc = client.quit();
+        assertEquals("OK", rc);
+    }
+
+    public void testSwapDb() {
+        String rc = client.swapDB(0, 1);
+        assertEquals("OK", rc);
     }
 }

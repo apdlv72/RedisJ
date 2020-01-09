@@ -1,6 +1,7 @@
 package com.redisj;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
@@ -394,6 +395,7 @@ public class TestRedisServer {
         map.put("c", "X");
         map.put("d", "Y");
         String rc = client.hmset(key, map);
+        assertNotNull(rc);
 
         List<String> list = client.hmget(key, "a", "b", "c", "d", "missing");
         assertEquals(5, list.size());

@@ -8,6 +8,10 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.net.BindException;
 import java.net.ServerSocket;
 import java.net.Socket;
@@ -48,11 +52,16 @@ public class RedisServer {
     public static final int DEFAULT_MAX_DB = 16;
 
     public RedisServer() {
-        this(DEFAULT_PORT);
+        this(DEFAULT_PORT, DEFAULT_MAX_DB);
     }
 
     public RedisServer(int port) {
-        this.port = port;
+        this(port, DEFAULT_MAX_DB);
+    }
+
+    public RedisServer(int port, int maxDb) {
+        this.port  = port;
+        this.maxDb = maxDb;
         databases = new TreeMap<Integer, Database>();
     }
 
@@ -423,6 +432,32 @@ public class RedisServer {
         return s;
     }
 
+    protected WorkerMethod findWorkerMethod(String cmd) throws IOException {
+
+        String name = cmd.toLowerCase();
+        WorkerMethod found = methodCache.get(name);
+        if (null!=found) {
+            return found;
+        }
+
+        Method method = null;
+        try {
+            method = Worker.class.getDeclaredMethod(name, Args.class);
+        }
+        catch (Exception e) {
+            return null;
+        }
+
+        RedisCommand anno = null==method ? null : method.getAnnotation(RedisCommand.class);
+        if (null==anno) {
+            return null;
+        }
+
+        found = new WorkerMethod(name, anno, method);
+        methodCache.put(name, found);
+        return found;
+    }
+
     class StartupThread extends Thread {
 
         @Override
@@ -541,6 +576,60 @@ public class RedisServer {
         private ExecutorService executor;
     }
 
+    class WorkerMethod {
+
+        private int min;
+        private int max;
+        private int args;
+        private boolean even;
+        private boolean odd;
+
+        public WorkerMethod(String name, RedisCommand anno, Method method) {
+            this.name = name;
+            //this.anno = anno;
+            this.method = method;
+            this.min  = anno.min();
+            this.max  = anno.max();
+            this.args = anno.args().length;
+            this.even = anno.even();
+            this.odd  = anno.odd();
+        }
+
+        String checkArguments(Args args) {
+
+            WorkerMethod rm = this;
+            int actual = args.size();
+            if (rm.min>-1 || rm.max>-1) {
+                if ((rm.min>-1 && actual<rm.min) || (rm.max>-1 && actual>rm.max)) {
+                    return String.format("Wrong number of arguments for '%s' command. Expected %d - %d but actual number is %d",
+                            rm.min, rm.max, actual);
+                }
+            }
+            else {
+                int expect = rm.args;
+                if (actual!=expect) {
+                    return String.format("Wrong number of arguments for '%s' command. Expected %d but actual number is %d",
+                            name, expect, actual);
+                }
+            }
+            if (rm.even && (actual%2)>0) {
+                return String.format("Number of arguments for '%s' command must be even", name);
+            }
+            if (rm.odd && (actual%2)==0) {
+                return String.format("Number of arguments for '%s' command must be odd", name);
+            }
+            return null;
+        }
+
+        public void invoke(Worker worker, Args args) throws IllegalAccessException, IllegalArgumentException, InvocationTargetException {
+            method.invoke(worker, args);
+        }
+
+        private String name;
+        //private RedisCommand anno;
+        private Method method;
+    }
+
     /**
      * This thread handles communication on a client socket.
      * I continues to read commands from the client and send replies until
@@ -587,7 +676,7 @@ public class RedisServer {
             reader = new RESPReader(socket);
 
             int commands = 0;
-            List<Object> list = null;
+            Args list = null;
             do {
                 list = null;
                 try {
@@ -605,9 +694,8 @@ public class RedisServer {
 
                 if (null!=list) {
                     try {
-                        String cmd = (String) list.remove(0);
-                        @SuppressWarnings("unchecked")
-                        List<String> args = (List<String>)(Object)list;
+                        String cmd  = (String) list.remove(0);
+                        Args   args = list;
 
                         int num = selectedDb;
                         if (!commandListeners.isEmpty()) {
@@ -637,227 +725,30 @@ public class RedisServer {
             socket = null;
         }
 
-        protected void dispatchCommand(String cmd, List<String> args) throws IOException {
-
-            final boolean FALSE = false;
-            cmd = cmd.toUpperCase();
-            char first = cmd.charAt(0);
+        protected void dispatchCommand(String cmd, Args args) throws IOException {
 
             try {
-                if (FALSE)  {
-                    // allows to sort below cases without removing "else"
+                WorkerMethod rm = findWorkerMethod(cmd);
+                if (null==rm) {
+                    writer.sendError("WRONGCMD", "Unknown command '%s'", cmd);
+                    return;
                 }
-                else if (cmd.equals("GET")) {
-                    assertArgCount(args, 1);
-                    get(args.get(0));
-                }
-                else if (cmd.equals("SET")) {
-                    assertArgCount(args, 2);
-                    set(args.get(0), args.get(1), false);
-                }
-                else if (cmd.equals("SAVE")) {
-                    save();
-                }
-                else if (cmd.equals("PING")) {
-                    ping();
-                }
-                else if (cmd.equals("ECHO")) {
-                    assertArgCount(args, 1);
-                    echo(args.get(0));
-                }
-                else if (cmd.equals("CLIENT")) {
-                    client(args);
-                }
-                else if (cmd.equals("FLUSHDB")) {
-                    assertArgCount(args, 0);
-                    flushdb();
-                }
-                else if (cmd.equals("SELECT")) {
-                    assertArgCount(args, 1);
-                    select(args.get(0));
-                }
-                else if (cmd.equals("INFO")) {
-                    assertArgCount(args, 0);
-                    info();
-                }
-                else if (cmd.equals("KEYS")) {
-                    assertArgCount(args, 1);
-                    keys(args.get(0));
-                }
-                else if (cmd.equals("MSET")) {
-                    mset(args, false);
-                }
-                else if (cmd.equals("MSETNX")) {
-                    mset(args, true);
-                }
-                else if (cmd.equals("APPEND")) {
-                    assertArgCount(args, 2);
-                    append(args.get(0), args.get(1));
-                }
-                else if (cmd.equals("SETNX")) {
-                    assertArgCount(args, 2);
-                    set(args.get(0), args.get(1), true);
-                }
-                else if (cmd.equals("MGET")) {
-                    mget(args);
-                }
-                else if (cmd.equals("SETEX")) {
-                    // TODO: Is there a difference between setnx and expire?
-                    assertArgCount(args, 2);
-                    expire(args.get(0), args.get(1));
-                }
-                else if (cmd.equals("EXPIRE")) {
-                    // TODO: Is there a difference between setnx and expire?
-                    assertArgCount(args, 2);
-                    expire(args.get(0), args.get(1));
-                }
-                else if (cmd.equals("TTL")) {
-                    assertArgCount(args, 1);
-                    ttl(args.get(0));
-                }
-                else if (cmd.equals("DEL")) {
-                    assertArgCount(args, 1);
-                    del(args.get(0));
-                }
-                else if (cmd.equals("INCR")) {
-                    assertArgCount(args, 1);
-                    incrDecr(args.get(0), true, "1", false);
-                }
-                else if (cmd.equals("DECR")) {
-                    assertArgCount(args, 1);
-                    incrDecr(args.get(0), false, "1", false);
-                }
-                else if (cmd.equals("INCRBY")) {
-                    assertArgCount(args, 2);
-                    incrDecr(args.get(0), true, args.get(1), false);
-                }
-                else if (cmd.equals("DECRBY")) {
-                    assertArgCount(args, 2);
-                    incrDecr(args.get(0), false, args.get(1), false);
-                }
-                else if (cmd.equals("INCRBYFLOAT")) {
-                    assertArgCount(args, 2);
-                    incrDecr(args.get(0), true, args.get(1), true);
-                }
-                else if (cmd.equals("DECRBYFLOAT")) {
-                    assertArgCount(args, 2);
-                    incrDecr(args.get(0), false, args.get(1), true);
-                }
-                else if (cmd.equals("TYPE")) {
-                    assertArgCount(args, 1);
-                    type(args.get(0));
-                }
-                else if (cmd.equals("LPUSH")) {
-                    assertArgCount(args, 2);
-                    lpush(args.get(0), args.get(1));
-                }
-                else if (cmd.equals("RPUSH")) {
-                    assertArgCount(args, 2);
-                    rpush(args.get(0), args.get(1));
-                }
-                else if (cmd.equals("LPOP")) {
-                    assertArgCount(args, 1);
-                    lpop(args.get(0));
-                }
-                else if (cmd.equals("RPOP")) {
-                    assertArgCount(args, 1);
-                    rpop(args.get(0));
-                }
-                else if (cmd.equals("BLPOP")) {
-                    blpop(args);
-                }
-                else if (cmd.equals("BRPOP")) {
-                    brpop(args);
-                }
-                else if (cmd.equals("LLEN")) {
-                    assertArgCount(args, 1);
-                    llen(args.get(0));
-                }
-                else if (first =='H') {
 
-                    if (cmd.equals("HEXISTS")) {
-                        assertArgCount(args, 2);
-                        String key = args.get(0);
-                        String field = args.get(1);
-                        hexists(key, field);
-                    }
-                    else if (cmd.equals("HSET")) {
-                        assertArgCount(args, 3);
-                        String key = args.get(0);
-                        String field = args.get(1);
-                        String value = args.get(2);
-                        hsetnx(key, field, value, false);
-                    }
-                    else if (cmd.equals("HSETNX")) {
-                        assertArgCount(args, 3);
-                        String key = args.get(0);
-                        String field = args.get(1);
-                        String value = args.get(2);
-                        hsetnx(key, field, value, true);
-                    }
-                    else if (cmd.equals("HINCRBYFLOAT")) {
-                        assertArgCount(args, 3);
-                        String key   = args.get(0);
-                        String field = args.get(1);
-                        String incr  = args.get(2);
-                        hincrbyfloat(key, field, incr);
-                    }
-                    else if (cmd.equals("HINCRBY")) {
-                        assertArgCount(args, 3);
-                        String key   = args.get(0);
-                        String field = args.get(1);
-                        String incr  = args.get(2);
-                        hincrby(key, field, incr);
-                    }
-                    else if (cmd.equals("HGETALL")) {
-                        assertArgCount(args, 1);
-                        String key = args.get(0);
-                        hgetall(key);
-                    }
-                    else if (cmd.equals("HGET")) {
-                        assertArgCount(args, 2);
-                        String key   = args.get(0);
-                        String field = args.get(1);
-                        hget(key, field);
-                    }
-                    else if (cmd.equals("HKEYS")) {
-                        assertArgCount(args, 1);
-                        String key   = args.get(0);
-                        hkeys(key);
-                    }
-                    else if (cmd.equals("HVALS")) {
-                        assertArgCount(args, 1);
-                        String key   = args.get(0);
-                        hvals(key);
-                    }
-                    else if (cmd.equals("HVALS")) {
-                        assertArgCount(args, 1);
-                        String key   = args.get(0);
-                        hvals(key);
-                    }
-                    else if (cmd.equals("HLEN")) {
-                        assertArgCount(args, 1);
-                        String key   = args.get(0);
-                        hlen(key);
-                    }
-                    else if (cmd.equals("HSTRLEN")) {
-                        assertArgCount(args, 2);
-                        String key   = args.get(0);
-                        String field = args.get(1);
-                        hstrlen(key, field);
-                    }
-                    else if (cmd.equals("HMSET")) {
-                        hmset(args);
-                    }
-                    else if (cmd.equals("HMGET")) {
-                        hmget(args);
-                    }
-                    else {
-                        writer.sendError("ERR", "Not implemented: '%s'", cmd);
-                    }
+                String error = rm.checkArguments(args);
+                if (null!=error) {
+                    writer.sendError("WRONGARGS", error);
+                    return;
+                }
+
+                rm.invoke(this, args);
+            }
+            catch (InvocationTargetException e) {
+                Throwable cause = e.getCause();
+                if (cause instanceof ClassCastException) {
+                    writer.sendError("WRONGTYPE", "Operation against a key holding the wrong kind of value");
                 }
                 else {
-                    writer.sendError("ERR", "Not implemented: " + cmd);
+                    writer.sendError("EXCEPTION", "%s", e.getMessage());
                 }
             }
             catch (ClassCastException e) {
@@ -866,42 +757,21 @@ public class RedisServer {
             catch (WrongNumberOfArgsException e) {
                 writer.sendError("ERR", "wrong number of arguments for '%s' command", cmd);
             }
-
-            totalCommandsProcessed++;
-        }
-
-        protected void client(List<String> args) throws IOException {
-
-            String cmd = args.get(0).toUpperCase();
-
-            if ("ID".equals(cmd)) {
-                writer.sendString(clientId);
+            catch (Exception e) {
+                writer.sendError("EXCEPTION", "%s", e.getMessage());
             }
-            else if ("LIST".equals(cmd)) {
-                writer.sendString("unsupported");
-            }
-            else if ("KILL".equals(cmd)) {
-                writer.sendString("unsupported");
-            }
-            else if ("SETNAME".equals(cmd)) {
-                clientName = args.get(1);
-                writer.write(OK_BYTES);
-            }
-            else if ("GETNAME".equals(cmd)) {
-                writer.sendString(clientName);
-            }
-            else {
-                writer.sendError("ERR", "Invalid command");
+            finally {
+                totalCommandsProcessed++;
             }
         }
 
-        protected void echo(String message) throws IOException {
-            writer.sendString(message);
-        }
+        @RedisCommand(args = {"key", "field"})
+        protected void hstrlen(Args args) throws IOException {
 
-        protected void hstrlen(String key, String field) throws IOException {
+            String key   = args.get(0);
+            String field = args.get(1);
+
             Database db = getSelectedDb();
-
             synchronized (db) {
                 Ageable a = db.get(key, false);
                 if (null!=a) {
@@ -910,12 +780,385 @@ public class RedisServer {
                     writer.sendNumber(value.length());
                     return;
                 }
-
                 writer.sendNumber(-1);
             }
         }
 
-        protected void hmget(List<String> args) throws IOException {
+        @RedisCommand(args = {"key", "field"})
+        protected void hget(Args args) throws IOException {
+
+            String key   = args.get(0);
+            String field = args.get(1);
+
+            Database db = getSelectedDb();
+            synchronized (db) {
+                Ageable a = db.get(key, false);
+                if (null!=a) {
+                    Hash hash = (Hash) a.value;
+                    String value = hash.get(field);
+                    writer.sendString(value);
+                    return;
+                }
+                writer.sendString(EMPTY_STRING);
+            }
+        }
+
+        @RedisCommand(args = {"key"})
+        protected void hgetall(Args args) throws IOException {
+
+            String key = args.get(0);
+
+            Database db = getSelectedDb();
+            synchronized (db) {
+                Ageable a = db.get(key, false);
+                List<String> list = new ArrayList<String>();
+                if (null!=a) {
+                    Hash hash = (Hash) a.value;
+
+                    for (Entry<String, String> entry : hash.entrySet()) {
+                        list.add(entry.getKey());
+                        list.add(entry.getValue());
+                    }
+                }
+                writer.sendArray(list);
+            }
+        }
+
+        @RedisCommand(args = {"key", "field", "amount"})
+        protected void hincrby(Args args) throws IOException {
+
+            String key   = args.get(0);
+            String field = args.get(1);
+            long incr = Long.parseLong(args.get(2));
+
+            Database db = getSelectedDb();
+            synchronized (db) {
+                Ageable a = db.get(key, false);
+                Hash hash = null;
+                if (null==a) {
+                    db.put(key, new Ageable(hash = new Hash()));
+                }
+                else {
+                    hash = (Hash) a.value;
+                }
+
+                String value = hash.getOrDefault(field, "0");
+                long sum = Long.parseLong(value)+incr;
+                String string = ""+sum;
+                hash.put(field, string);
+                writer.sendNumber(sum);
+            }
+        }
+
+        @RedisCommand(args = {"key", "field", "amount"})
+        protected void hincrbyfloat(Args args) throws IOException {
+
+            String key   = args.get(0);
+            String field = args.get(1);
+            double incr = Double.parseDouble(args.get(2));
+
+            Database db = getSelectedDb();
+            synchronized (db) {
+                Ageable a = db.get(key, false);
+                Hash hash = null;
+                if (null==a) {
+                    db.put(key, new Ageable(hash = new Hash()));
+                }
+                else {
+                    hash = (Hash) a.value;
+                }
+
+                String value = hash.getOrDefault(field, "0");
+                double sum = Double.parseDouble(value)+incr;
+                String string = ""+sum;
+                hash.put(field, string);
+                writer.sendString(string);
+            }
+        }
+
+        @RedisCommand(args = {"key", "field", "value"})
+        protected void hsetnx(Args args) throws IOException {
+            String key = args.get(0);
+            String field = args.get(1);
+            String value = args.get(2);
+            _hset(key, field, value, true);
+        }
+
+        @RedisCommand(args = {"key", "field", "value"})
+        protected void hset(Args args) throws IOException {
+            String key = args.get(0);
+            String field = args.get(1);
+            String value = args.get(2);
+            _hset(key, field, value, false);
+        }
+
+        @RedisCommand(args = {"key", "field"})
+        protected void hexists(Args args) throws IOException {
+
+            String key = args.get(0);
+            String field = args.get(1);
+
+            Database db = getSelectedDb();
+            synchronized (db) {
+                Ageable a = db.get(key, false);
+                if (null!=a) {
+                    Hash h = (Hash) a.value;
+                    if (h.containsKey(field)) {
+                        writer.sendNumber(1);
+                        return;
+                    }
+                }
+                writer.sendNumber(0);
+            }
+        }
+
+        @RedisCommand(args = {"key"})
+        protected void llen(Args args) throws IOException {
+
+            String key = args.get(0);
+            Database db = getSelectedDb();
+            Ageable a = db.get(key, false);
+            if (null==a) {
+                writer.sendNumber(0);
+            }
+            else {
+                List<Object> list = a.get();
+                writer.sendNumber(list.size());
+            }
+        }
+
+        @RedisCommand(args = {"key"})
+        protected void lpop(Args args) throws IOException {
+            String key = args.get(0);
+            _pop(key, true);
+        }
+
+        @RedisCommand(args = {"key"})
+        protected void rpop(Args args) throws IOException {
+            String key = args.get(0);
+            _pop(key, false);
+        }
+
+        @RedisCommand(args = {"key", "value"})
+        protected void rpushx(String cmd) throws IOException {
+            _todo(cmd);
+        }
+
+        @RedisCommand(args = {"key", "value"})
+        protected void rpush(Args args) throws IOException {
+            String key   = args.get(0);
+            String value = args.get(1);
+            _push(key, value, false);
+        }
+
+        @RedisCommand(args = {"key", "value"})
+        protected void lpush(Args args) throws IOException {
+            String key   = args.get(0);
+            String value = args.get(1);
+            _push(key, value, true);
+        }
+
+        @RedisCommand(args = {"key"})
+        protected void type(Args args) throws IOException {
+
+            String key = args.get(0);
+
+            Ageable ageable = getSelectedDb().get(key, false);
+            if (notExpired(ageable)) {
+                Object value = ageable.value;
+                if (value instanceof String) {
+                    writer.write("+string\r\n".getBytes());
+                }
+                else if (value instanceof List) {
+                    writer.write("+list\r\n".getBytes());
+                }
+                else if (value instanceof Set) {
+                    writer.write("+set\r\n".getBytes());
+                }
+                else if (value instanceof Map) {
+                    writer.write("+hash\r\n".getBytes());
+                }
+                else if (value instanceof ZSet) {
+                    writer.write("+zset\r\n".getBytes());
+                }
+                else {
+                    writer.write(NONE_BYTES);
+                }
+            }
+            else {
+                writer.write(NONE_BYTES);
+            }
+        }
+
+        @RedisCommand(args = {"key", "amout"})
+        protected void decrbyfloat(Args args) throws IOException {
+            _incrDecr(args.get(0), false, args.get(1), true);
+        }
+
+        @RedisCommand(args = {"key", "amout"})
+        protected void incrbyfloat(Args args) throws IOException {
+            _incrDecr(args.get(0), true, args.get(1), true);
+        }
+
+        @RedisCommand(args = {"key", "amout"})
+        protected void decrby(Args args) throws IOException {
+            _incrDecr(args.get(0), false, args.get(1), false);
+        }
+
+        @RedisCommand(args = {"key", "amout"})
+        protected void incrby(Args args) throws IOException {
+            _incrDecr(args.get(0), true, args.get(1), false);
+        }
+
+        @RedisCommand(args = {"key"})
+        protected void decr(Args args) throws IOException {
+            _incrDecr(args.get(0), false, "1", false);
+        }
+
+        @RedisCommand(args = {"key"})
+        protected void incr(Args args) throws IOException {
+            _incrDecr(args.get(0), true, "1", false);
+        }
+
+        @RedisCommand(args = {"db"})
+        protected void select(Args args) throws IOException {
+            String num = args.get(0);
+            selectedDb = Integer.parseInt(num);
+            if (maxDb>-1 && selectedDb>=maxDb) {
+                writer.sendError("ERR", "Invalid database");
+            }
+            else {
+                writer.write("+OK\r\n".getBytes());
+            }
+        }
+
+        @RedisCommand(args = {"pattern"})
+        protected void keys(Args args) throws IOException {
+
+            String glob = args.get(0);
+
+            Pattern rex = createRegexFromGlob(glob);
+            ArrayList<String> matches = new ArrayList<String>();
+
+            StringBuilder sb = new StringBuilder();
+            Database db = getSelectedDb();
+            for (String key : db.keySet()) {
+                if (rex.matcher(key).matches()) {
+                    matches.add(key);
+                }
+            }
+
+            sb.append("*").append(matches.size()).append(CRLF_STRING);
+            for (String key : matches) {
+                sb.append("$").append(key.length()).append(CRLF_STRING);
+                sb.append(key).append(CRLF_STRING);
+            }
+
+            String string = sb.toString();
+            writer.write(string.getBytes());
+        }
+
+        @RedisCommand(args= {"key"})
+        protected void get(Args args) throws IOException {
+
+            String key = args.get(0);
+
+            Database db = getSelectedDb();
+            Ageable ageable = db.get(key, false);
+            if (null==ageable) {
+                writer.write(EMPTY_BYTES);
+            }
+            else {
+                String string = (String) ageable.value;
+                writer.sendString(string);
+            }
+        }
+
+        @RedisCommand(args = {"key", "value"})
+        protected void set(Args args) throws IOException {
+            _set(args, false);
+        }
+
+        @RedisCommand(args = {"key", "value"})
+        protected void setnx(Args args) throws IOException {
+            _set(args, true);
+        }
+
+        @RedisCommand(args = {"key", "value"})
+        protected void append(Args args) throws IOException {
+
+            String key = args.get(0);
+            String value = args.get(1);
+
+            Database db = getSelectedDb().markDirty();
+
+            Ageable a = db.get(key, false);
+            long len = 0;
+            if (null==a) {
+                db.put(key, new Ageable(value));
+                len = value.length();
+            }
+            else {
+                String s = a.value.toString() + value;
+                a.value = s;
+                len = s.length();
+            }
+            writer.sendNumber(len);
+        }
+
+        @RedisCommand(args = {"key1", "key2", "..."}, min=1)
+        protected void mget(Args args) throws IOException {
+
+            Database db = getSelectedDb();
+            writer.sendArrayLength(args.size());
+
+            for (String key : args) {
+                Ageable ageable = db.get(key, false);
+                if (null==ageable) {
+                    writer.write(EMPTY_BYTES);
+                }
+                else {
+                    writer.sendString(ageable.value.toString());
+                }
+            }
+        }
+
+        @RedisCommand(args = {"subcmd", "[option]"}, min=1, max=2)
+        protected void client(Args args) throws IOException {
+
+            String subcmd = args.get(0).toUpperCase();
+
+            if ("ID".equals(subcmd)) {
+                writer.sendString(clientId);
+            }
+            else if ("LIST".equals(subcmd)) {
+                writer.sendString("unsupported");
+            }
+            else if ("KILL".equals(subcmd)) {
+                writer.sendString("unsupported");
+            }
+            else if ("SETNAME".equals(subcmd)) {
+                assertArgCount(args, 2);
+                clientName = args.get(1);
+                writer.write(OK_BYTES);
+            }
+            else if ("GETNAME".equals(subcmd)) {
+                writer.sendString(clientName);
+            }
+            else {
+                writer.sendError("ERR", "Invalid command");
+            }
+        }
+
+        @RedisCommand(args = {"message"})
+        protected void echo(Args args) throws IOException {
+
+            String message = args.get(0);
+            writer.sendString(message);
+        }
+
+        @RedisCommand(args = {"key", "field1", "field2", "field3", "..."}, min=2)
+        protected void hmget(Args args) throws IOException {
 
             String key = args.get(0);
             Database db = getSelectedDb();
@@ -934,10 +1177,11 @@ public class RedisServer {
             }
         }
 
-        protected void hmset(List<String> args) throws IOException {
+        @RedisCommand(args = {"key", "field1", "value1", "field2", "value2", "..."}, odd=true, min=3)
+        protected void hmset(Args args) throws IOException {
 
-            String key = args.get(0);
-            Database db = getSelectedDb();
+            String   key = args.get(0);
+            Database db  = getSelectedDb();
 
             synchronized (db) {
                 Ageable a = db.get(key, false);
@@ -957,9 +1201,11 @@ public class RedisServer {
             }
         }
 
-        protected void hkeys(String key) throws IOException {
-            Database db = getSelectedDb();
+        @RedisCommand(args = {"key"})
+        protected void hkeys(Args args) throws IOException {
 
+            String key  = args.get(0);
+            Database db = getSelectedDb();
             synchronized (db) {
                 Ageable a = db.get(key, false);
                 List<String> list = new ArrayList<String>();
@@ -973,9 +1219,11 @@ public class RedisServer {
             }
         }
 
-        protected void hvals(String key) throws IOException {
-            Database db = getSelectedDb();
+        @RedisCommand(args = {"key"})
+        protected void hvals(Args args) throws IOException {
 
+            String key  = args.get(0);
+            Database db = getSelectedDb();
             synchronized (db) {
                 Ageable a = db.get(key, false);
                 List<String> list = new ArrayList<String>();
@@ -989,9 +1237,11 @@ public class RedisServer {
             }
         }
 
-        protected void hlen(String key) throws IOException {
-            Database db = getSelectedDb();
+        @RedisCommand(args = {"key"})
+        protected void hlen(Args args) throws IOException {
 
+            String key  = args.get(0);
+            Database db = getSelectedDb();
             synchronized (db) {
                 Ageable a = db.get(key, false);
                 if (null!=a) {
@@ -1004,124 +1254,8 @@ public class RedisServer {
             }
         }
 
-        protected void hget(String key, String field) throws IOException {
-            Database db = getSelectedDb();
-
-            synchronized (db) {
-                Ageable a = db.get(key, false);
-                if (null!=a) {
-                    Hash hash = (Hash) a.value;
-                    String value = hash.get(field);
-                    writer.sendString(value);
-                    return;
-                }
-                writer.sendString(EMPTY_STRING);
-            }
-        }
-
-        protected void hgetall(String key) throws IOException {
-            Database db = getSelectedDb();
-
-            synchronized (db) {
-                Ageable a = db.get(key, false);
-                List<String> list = new ArrayList<String>();
-                if (null!=a) {
-                    Hash hash = (Hash) a.value;
-
-                    for (Entry<String, String> entry : hash.entrySet()) {
-                        list.add(entry.getKey());
-                        list.add(entry.getValue());
-                    }
-                }
-                writer.sendArray(list);
-            }
-        }
-
-        protected void hincrbyfloat(String key, String field, String amount) throws IOException {
-
-            double incr = Double.parseDouble(amount);
-            Database db = getSelectedDb();
-
-            synchronized (db) {
-                Ageable a = db.get(key, false);
-                Hash hash = null;
-                if (null==a) {
-                    db.put(key, new Ageable(hash = new Hash()));
-                }
-                else {
-                    hash = (Hash) a.value;
-                }
-
-                String value = hash.getOrDefault(field, "0");
-                double sum = Double.parseDouble(value)+incr;
-                String string = ""+sum;
-                hash.put(field, string);
-                writer.sendString(string);
-            }
-        }
-
-        protected void hincrby(String key, String field, String amount) throws IOException {
-
-            long incr = Long.parseLong(amount);
-            Database db = getSelectedDb();
-
-            synchronized (db) {
-                Ageable a = db.get(key, false);
-                Hash hash = null;
-                if (null==a) {
-                    db.put(key, new Ageable(hash = new Hash()));
-                }
-                else {
-                    hash = (Hash) a.value;
-                }
-
-                String value = hash.getOrDefault(field, "0");
-                long sum = Long.parseLong(value)+incr;
-                String string = ""+sum;
-                hash.put(field, string);
-                writer.sendNumber(sum);
-            }
-        }
-
-        protected void hsetnx(String key, String field, String value, boolean nx) throws IOException {
-            Database db = getSelectedDb();
-            synchronized (db) {
-                Ageable a = db.get(key, false);
-                Hash hash = null;
-                if (null==a) {
-                    db.put(key, new Ageable(hash = new Hash()));
-                }
-                else {
-                    hash = (Hash) a.value;
-                }
-
-                if (nx && hash.contains(field)) {
-                    writer.sendNumber(0);
-                }
-                else {
-                    hash.put(field, value);
-                    writer.sendNumber(1);
-                }
-            }
-
-        }
-
-        protected void hexists(String key, String field) throws IOException {
-            Database db = getSelectedDb();
-            synchronized (db) {
-                Ageable a = db.get(key, false);
-                if (null!=a) {
-                    Hash h = (Hash) a.value;
-                    if (h.containsKey(field)) {
-                        writer.sendNumber(1);
-                        return;
-                    }
-                }
-                writer.sendNumber(0);
-            }
-        }
-
-        protected void save() throws IOException {
+        @RedisCommand(args = {})
+        protected void save(Args args) throws IOException {
 
             Persistifier pers = new Persistifier(RedisServer.this, "/tmp/radisj");
             pers.persist(databases);
@@ -1129,52 +1263,223 @@ public class RedisServer {
             writer.write(OK_BYTES);
         }
 
-        protected void ping() throws IOException {
+        @RedisCommand(args = {})
+        protected void ping(Args args) throws IOException {
             writer.sendString("PONG");
         }
 
-        protected void lpop(String key) throws IOException {
-            pop(key, true);
+        @RedisCommand(args = {"key1", "key2", "...", "timeout"}, min=2)
+        protected void blpop(Args args) throws IOException {
+            _bpop(true, args);
         }
 
-        protected void rpop(String key) throws IOException {
-            pop(key, false);
+        @RedisCommand(args = {"key"})
+        protected void brpop(Args args) throws IOException {
+            _bpop(false, args);
         }
 
-        protected void blpop(List<String> args) throws IOException {
-            bpop(true, args);
+        @RedisCommand(args={"key"})
+        protected void del(Args args) throws IOException {
+            String key = args.get(0);
+            Ageable ageable = getSelectedDb().markDirty().remove(key);
+            writer.sendNumber(notExpired(ageable) ? 1 : 0);
         }
 
-        protected void brpop(List<String> args) throws IOException {
-            bpop(false, args);
+        @RedisCommand(args = {})
+        protected void flushdb(Args args) throws IOException {
+            getSelectedDb().markDirty().clear();
+            writer.write(OK_BYTES);
         }
 
-        protected void pop(String key, boolean left) throws IOException {
+        @RedisCommand(args = {"key"})
+        protected void ttl(Args args) throws IOException {
+
+            String key = args.get(0);
+            Database db = getSelectedDb();
+            long ttl = -2;
+
+            Ageable ageable = db.get(key, false);
+            if (notExpired(ageable)) {
+                if (ageable.expires<0) {
+                    ttl = -1;
+                }
+                else {
+                    ttl = (now()-ageable.expires)/1000;
+                }
+            }
+            else {
+                ttl = -2;
+            }
+
+            writer.sendNumber(ttl);
+        }
+
+        @RedisCommand(args = {"key", "ttl"})
+        protected void expire(Args args) throws IOException {
+
+            String key = args.get(0);
+            String ttl = args.get(1);
+
             Database db = getSelectedDb().markDirty();
-            Object item = null;
-            Ageable a = db.get(key, false);
-            if (null!=a) {
-                @SuppressWarnings("unchecked")
-                List<Object> list = (List<Object>) a.value;
-                if (list.size()>0) {
-                    if (left) {
-                        item = list.remove(0);
-                    }
-                    else {
-                        item = list.remove(list.size()-1);
+            int seconds = Integer.parseInt(ttl);
+
+            Ageable ageable = db.get(key, false);
+            if (notExpired(ageable)) {
+                ageable.expires = now()+1000*seconds;
+                //output.write(":0\r\n".getBytes());
+                writer.sendNumber(0);
+            }
+            else {
+                //output.write(":1\r\n".getBytes());
+                writer.sendNumber(1);
+            }
+        }
+
+        @RedisCommand(args = {"key1", "val1", "key2", "val2"}, min=2, even=true)
+        protected void mset(Args args) throws IOException {
+            _mset(args, false);
+        }
+
+        @RedisCommand(args = {"key1", "val1", "key2", "val2"}, min=2, even=true)
+        protected void msetnx(Args args) throws IOException {
+            _mset(args, true);
+        }
+
+        @RedisCommand(args = {})
+        protected void info(Args args) throws IOException {
+
+            StringBuilder sb = new StringBuilder();
+
+            long uptime_in_seconds = (now()-startTime)/1000;
+
+            sb.append("# Server\r\n");
+            sb.append("redis_version:2.8.13 ***** THIS IS NOT REAL REDIS BUT A VERY BASIC JAVA PORT *****\r\n");
+            sb.append(String.format("tcp_port:%d\r\n", port));
+            sb.append(String.format("uptime_in_seconds:%d\r\n", uptime_in_seconds));
+            sb.append(CRLF_STRING);
+
+            sb.append("# Stats\r\n");
+            sb.append(String.format("total_connections_received:%d\r\n", totalConnectionsReceived));
+            sb.append(String.format("total_commands_processed:%d\r\n", totalCommandsProcessed));
+            sb.append(CRLF_STRING);
+
+            sb.append("# Clients\r\n");
+            sb.append(String.format("connected_clients:%d\r\n", connectedClients));
+            sb.append(String.format("client_longest_output_list:%d\r\n", clientLongestOutputList));
+            sb.append(String.format("client_biggest_input_buf:%d\r\n", clientBiggestInputBuf));
+            sb.append(String.format("blocked_clients:%d\r\n", blockedClients));
+            sb.append(CRLF_STRING);
+
+            sb.append("# Keyspace\r\n");
+            Set<Integer> keys = null;
+            synchronized (databases) {
+                keys = databases.keySet();
+            }
+
+            for (Integer num : keys) {
+                Database db = RedisServer.this.getDb(num);
+                int count = db.size();
+                long expires = 0;
+                long avgTtl = 0;
+                sb.append(String.format("db%d:keys=%d,expires=%d,avg_ttl=%d\r\n", num, count, expires, avgTtl ));
+            }
+
+            writer.sendReply(sb);
+        }
+
+        protected void _set(List<String> args, boolean nx) throws IOException {
+
+            assertArgCount(args, 2);
+            String key  = args.get(0);
+            String value = args.get(1);
+
+            logInfo("SET: " + key + " (" + value.length() + " chars)");
+
+            Database db = getSelectedDb().markDirty();
+            if (nx) {
+                if (db.containsKey(key)) {
+                    writer.sendError("ERR", "Key exists");
+                    return;
+                }
+            }
+
+            db.put(key, new Ageable(value));
+            writer.write(OK_BYTES);
+        }
+
+        protected void _mset(List<String> args, boolean nx) throws IOException {
+
+            Database db = getSelectedDb().markDirty();
+
+            if (nx) {
+                for (int i=1; i<args.size(); i+=2) {
+
+                    String key = args.get(i);
+
+                    Ageable a = db.get(key, false);
+                    if (notExpired(a)) {
+                        logInfo("Key exists: " + key);
+                        writer.write(":0\r\n".getBytes());
+                        return;
                     }
                 }
             }
 
-            if (null==item) {
-                writer.write(EMPTY_BYTES);
+            int count = 0;
+            for (int i=0; i<args.size(); i+=2) {
+
+                String key = args.get(i);
+                String val = args.get(i+1);
+
+                if (nx) {
+                    Ageable a = db.get(key, false);
+                    if (notExpired(a)) {
+                        logInfo("Key exists: " + key);
+                    }
+                }
+
+                db.put(key, new Ageable(val));
+                count ++;
+            }
+
+            if (nx) {
+                writer.sendNumber(count);
             }
             else {
-                writer.sendString(item.toString());
+                writer.write(OK_BYTES);
             }
         }
 
-        protected void bpop(boolean left, List<String> args) throws IOException {
+        protected void _incrDecr(String key, boolean incr, String amount, boolean _float) throws IOException {
+
+            Database db = getSelectedDb().markDirty();
+            Ageable a = db.get(key, false);
+            if (null==a) {
+                db.put(key, a = new Ageable("0"));
+            }
+
+            if (_float) {
+                Double b = (incr ? 1 : -1) * toDouble(amount);
+                String s = a.get();
+                Double l = toDouble(s)+b;
+                s = l.toString();;
+                a.value  = s;
+                writer.sendString(s);
+            }
+            else {
+                Long    b = (incr ? 1 : -1) * toLong(amount);
+                String  s = a.get();
+                Long    l = toLong(s)+b;
+                a.value = l.toString();;
+                writer.sendNumber(l);
+            }
+        }
+
+        protected void _todo(String cmd) throws IOException {
+            _todo(cmd);
+        }
+
+        protected void _bpop(boolean left, List<String> args) throws IOException {
 
             String last = args.get(args.size()-1);
             Long timeout = toLong(last);
@@ -1226,15 +1531,32 @@ public class RedisServer {
             writer.write(EMPTY_BYTES);
         }
 
-        protected void lpush(String key, String value) throws IOException {
-            push(key, value, true);
+        protected void _pop(String key, boolean left) throws IOException {
+            Database db = getSelectedDb().markDirty();
+            Object item = null;
+            Ageable a = db.get(key, false);
+            if (null!=a) {
+                @SuppressWarnings("unchecked")
+                List<Object> list = (List<Object>) a.value;
+                if (list.size()>0) {
+                    if (left) {
+                        item = list.remove(0);
+                    }
+                    else {
+                        item = list.remove(list.size()-1);
+                    }
+                }
+            }
+
+            if (null==item) {
+                writer.write(EMPTY_BYTES);
+            }
+            else {
+                writer.sendString(item.toString());
+            }
         }
 
-        protected void rpush(String key, String value) throws IOException {
-            push(key, value, false);
-        }
-
-        protected void push(String key, String val, boolean left) throws IOException {
+        protected void _push(String key, String val, boolean left) throws IOException {
             Database db = getSelectedDb().markDirty();
             Ageable a = db.get(key, false);
             if (null==a) {
@@ -1258,302 +1580,27 @@ public class RedisServer {
             }
         }
 
-        protected void llen(String key) throws IOException {
+        protected void _hset(String key, String field, String value, boolean nx) throws IOException {
             Database db = getSelectedDb();
-            Ageable a = db.get(key, false);
-            if (null==a) {
-                writer.sendNumber(0);
-            }
-            else {
-                Object obj = a.value;
-                if (!(obj instanceof List)) {
-                    writer.sendError("WRONGTYPE", "Operation against a key holding the wrong kind of value");
+            synchronized (db) {
+                Ageable a = db.get(key, false);
+                Hash hash = null;
+                if (null==a) {
+                    db.put(key, new Ageable(hash = new Hash()));
                 }
                 else {
-                    @SuppressWarnings("unchecked")
-                    List<Object> list = (List<Object>) obj;
-                    writer.sendNumber(list.size());
+                    hash = (Hash) a.value;
                 }
-            }
-        }
 
-        protected void incrDecr(String key, boolean incr, String amount, boolean _float) throws IOException {
-
-            Database db = getSelectedDb().markDirty();
-            Ageable a = db.get(key, false);
-            if (null==a) {
-                db.put(key, a = new Ageable("0"));
-            }
-
-            if (_float) {
-                Double b = (incr ? 1 : -1) * toDouble(amount);
-                String s = a.get();
-                Double l = toDouble(s)+b;
-                s = l.toString();;
-                a.value  = s;
-                writer.sendString(s);
-            }
-            else {
-                Long    b = (incr ? 1 : -1) * toLong(amount);
-                String  s = a.get();
-                Long    l = toLong(s)+b;
-                a.value = l.toString();;
-                writer.sendNumber(l);
-            }
-        }
-
-        protected void select(String num) throws IOException {
-            selectedDb = Integer.parseInt(num);
-            if (selectedDb>=DEFAULT_MAX_DB) {
-                writer.sendError("ERR", "Invalid database");
-            }
-            else {
-                writer.write("+OK\r\n".getBytes());
-            }
-        }
-
-        protected void set(String key, String value, boolean nx) throws IOException {
-
-            logInfo("SET: " + key + " (" + value.length() + " chars)");
-
-            Database db = getSelectedDb().markDirty();
-            if (nx) {
-                if (db.containsKey(key)) {
-                    writer.sendError("ERR", "Key exists");
-                    return;
-                }
-            }
-
-            db.put(key, new Ageable(value));
-            writer.write(OK_BYTES);
-        }
-
-        protected void append(String key, String value) throws IOException {
-            Database db = getSelectedDb().markDirty();
-
-            Ageable a = db.get(key, false);
-            long len = 0;
-            if (null==a) {
-                set(key, value, false);
-                len = value.length();
-            }
-            else {
-                String s = a.value.toString() + value;
-                a.value = s;
-                len = s.length();
-            }
-            writer.sendNumber(len);
-        }
-
-        protected void get(String key) throws IOException {
-            Database db = getSelectedDb();
-            Ageable ageable = db.get(key, false);
-            if (null==ageable) {
-                writer.write(EMPTY_BYTES);
-            }
-            else {
-                String string = (String) ageable.value;
-                writer.sendString(string);
-            }
-        }
-
-        protected void mget(List<String> args) throws IOException {
-
-            Database db = getSelectedDb();
-            writer.sendArrayLength(args.size());
-
-            for (String key : args) {
-                Ageable ageable = db.get(key, false);
-                if (null==ageable) {
-                    writer.write(EMPTY_BYTES);
+                if (nx && hash.contains(field)) {
+                    writer.sendNumber(0);
                 }
                 else {
-                    writer.sendString(ageable.value.toString());
-                }
-            }
-        }
-
-        protected void keys(String glob) throws IOException {
-
-            Pattern rex = createRegexFromGlob(glob);
-            ArrayList<String> matches = new ArrayList<String>();
-
-            StringBuilder sb = new StringBuilder();
-            Database db = getSelectedDb();
-            for (String key : db.keySet()) {
-                if (rex.matcher(key).matches()) {
-                    matches.add(key);
+                    hash.put(field, value);
+                    writer.sendNumber(1);
                 }
             }
 
-            sb.append("*").append(matches.size()).append(CRLF_STRING);
-            for (String key : matches) {
-                sb.append("$").append(key.length()).append(CRLF_STRING);
-                sb.append(key).append(CRLF_STRING);
-            }
-
-            String string = sb.toString();
-            writer.write(string.getBytes());
-        }
-
-        protected void type(String key) throws IOException {
-            Ageable ageable = getSelectedDb().get(key, false);
-            if (notExpired(ageable)) {
-                Object value = ageable.value;
-                if (value instanceof String) {
-                    writer.write("+string\r\n".getBytes());
-                }
-                else if (value instanceof List) {
-                    writer.write("+list\r\n".getBytes());
-                }
-                else if (value instanceof Set) {
-                    writer.write("+set\r\n".getBytes());
-                }
-                else if (value instanceof Map) {
-                    writer.write("+hash\r\n".getBytes());
-                }
-                else if (value instanceof ZSet) {
-                    writer.write("+zset\r\n".getBytes());
-                }
-                else {
-                    writer.write(NONE_BYTES);
-                }
-            }
-            else {
-                writer.write(NONE_BYTES);
-            }
-        }
-
-        protected void del(String key) throws IOException {
-            Ageable ageable = getSelectedDb().markDirty().remove(key);
-            writer.sendNumber(notExpired(ageable) ? 1 : 0);
-        }
-
-        protected void flushdb() throws IOException {
-            getSelectedDb().markDirty().clear();
-            writer.write(OK_BYTES);
-        }
-
-        protected void ttl(String key) throws IOException {
-
-            Database db = getSelectedDb();
-            long ttl = -2;
-
-            Ageable ageable = db.get(key, false);
-            if (notExpired(ageable)) {
-                if (ageable.expires<0) {
-                    ttl = -1;
-                }
-                else {
-                    ttl = (now()-ageable.expires)/1000;
-                }
-            }
-            else {
-                ttl = -2;
-            }
-
-            writer.sendNumber(ttl);
-        }
-
-        protected void expire(String key, String ttl) throws IOException {
-
-            Database db = getSelectedDb().markDirty();
-            int seconds = Integer.parseInt(ttl);
-
-            Ageable ageable = db.get(key, false);
-            if (notExpired(ageable)) {
-                ageable.expires = now()+1000*seconds;
-                //output.write(":0\r\n".getBytes());
-                writer.sendNumber(0);
-            }
-            else {
-                //output.write(":1\r\n".getBytes());
-                writer.sendNumber(1);
-            }
-        }
-
-        protected void mset(List<String> args, boolean nx) throws IOException {
-
-            Database db = getSelectedDb().markDirty();
-
-            if (nx) {
-                for (int i=1; i<args.size(); i+=2) {
-
-                    String key = args.get(i);
-
-                    Ageable a = db.get(key, false);
-                    if (notExpired(a)) {
-                        logInfo("Key exists: " + key);
-                        writer.write(":0\r\n".getBytes());
-                        return;
-                    }
-                }
-            }
-
-            int count = 0;
-            for (int i=0; i<args.size(); i+=2) {
-
-                String key = args.get(i);
-                String val = args.get(i+1);
-
-                if (nx) {
-                    Ageable a = db.get(key, false);
-                    if (notExpired(a)) {
-                        logInfo("Key exists: " + key);
-                    }
-                }
-
-                db.put(key, new Ageable(val));
-                count ++;
-            }
-
-            if (nx) {
-                writer.sendNumber(count);
-            }
-            else {
-                writer.write(OK_BYTES);
-            }
-        }
-
-        protected void info() throws IOException {
-
-            StringBuilder sb = new StringBuilder();
-
-            long uptime_in_seconds = (now()-startTime)/1000;
-
-            sb.append("# Server\r\n");
-            sb.append("redis_version:2.8.13 ***** THIS IS NOT REAL REDIS BUT A VERY BASIC JAVA PORT *****\r\n");
-            sb.append(String.format("tcp_port:%d\r\n", port));
-            sb.append(String.format("uptime_in_seconds:%d\r\n", uptime_in_seconds));
-            sb.append(CRLF_STRING);
-
-            sb.append("# Stats\r\n");
-            sb.append(String.format("total_connections_received:%d\r\n", totalConnectionsReceived));
-            sb.append(String.format("total_commands_processed:%d\r\n", totalCommandsProcessed));
-            sb.append(CRLF_STRING);
-
-            sb.append("# Clients\r\n");
-            sb.append(String.format("connected_clients:%d\r\n", connectedClients));
-            sb.append(String.format("client_longest_output_list:%d\r\n", clientLongestOutputList));
-            sb.append(String.format("client_biggest_input_buf:%d\r\n", clientBiggestInputBuf));
-            sb.append(String.format("blocked_clients:%d\r\n", blockedClients));
-            sb.append(CRLF_STRING);
-
-            sb.append("# Keyspace\r\n");
-            Set<Integer> keys = null;
-            synchronized (databases) {
-                keys = databases.keySet();
-            }
-
-            for (Integer num : keys) {
-                Database db = RedisServer.this.getDb(num);
-                int count = db.size();
-                long expires = 0;
-                long avgTtl = 0;
-                sb.append(String.format("db%d:keys=%d,expires=%d,avg_ttl=%d\r\n", num, count, expires, avgTtl ));
-            }
-
-            writer.sendReply(sb);
         }
 
         protected void assertArgCount(List<String> args, int expected) throws WrongNumberOfArgsException {
@@ -1647,7 +1694,7 @@ public class RedisServer {
             return s;
         }
 
-        public List<Object> readList() throws IOException {
+        public Args readList() throws IOException {
 
             String line = br.readLine();
             if (null==line) {
@@ -1661,7 +1708,7 @@ public class RedisServer {
             }
 
             int count = Integer.parseInt(line.substring(1));
-            List<Object> list = readList(count);
+            Args list = readList(count);
             return list;
         }
 
@@ -1674,8 +1721,8 @@ public class RedisServer {
             return number;
         }
 
-        protected List<Object> readList(int count) throws IOException {
-            List<Object> list = new ArrayList<Object>();
+        protected Args readList(int count) throws IOException {
+            Args list = new Args();
             for (int i=0; i<count; i++) {
                 String s = readString();
                 list.add(s);
@@ -2205,6 +2252,25 @@ public class RedisServer {
 
     }
 
+    @SuppressWarnings("serial")
+    class Args extends ArrayList<String> {
+
+    }
+
+    /**
+     * We need this annotation at runtime to find methods matching redis command:
+     */
+    @Retention( RetentionPolicy.RUNTIME )
+    public @interface RedisCommand {
+        String[] args();
+
+        boolean even() default false;
+        boolean odd() default false;
+
+        int min() default -1;
+        int max() default -1;
+    }
+
     static final String CN = RedisServer.class.getSimpleName();
 
     protected static final String CRLF_STRING  = "\r\n";
@@ -2215,6 +2281,8 @@ public class RedisServer {
 
     protected static final byte[] OK_BYTES   = "+OK\r\n".getBytes();
     protected static final byte[] NONE_BYTES = "+none\r\n".getBytes();
+
+    protected Map<String, WorkerMethod> methodCache = new HashMap<String, RedisServer.WorkerMethod>();
 
     protected List<RedisListener> commandListeners = new ArrayList<RedisListener>();
 
@@ -2229,6 +2297,7 @@ public class RedisServer {
     protected long startTime;
     protected Map<Integer, Database> databases;
     protected int port;
+    protected int maxDb;
     protected Persistifier persistifier;
     protected PortListener portListener;
     protected StartupThread startupThread;
