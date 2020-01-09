@@ -8,6 +8,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
+import java.net.BindException;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketAddress;
@@ -80,12 +81,12 @@ public class RedisServer {
 
             this.stopRequested = false;
 
-            if (null!=listenThread) {
-                listenThread.interrupt();
-                listenThread = null;
+            if (null!=portListener) {
+                portListener.interrupt();
+                portListener = null;
             }
 
-            listenThread  = new PortListener(port);
+            portListener  = new PortListener(port);
             startupThread = new StartupThread();
             startupThread.start();
 
@@ -101,17 +102,17 @@ public class RedisServer {
                 }
             }
 
-            if (background) listenThread.start(); else listenThread.run();
+            if (background) portListener.start(); else portListener.run();
         }
     }
 
     public void stop() {
         try {
-            if (null!=listenThread) {
-                listenThread.stopRequested = true;
-                listenThread.socket.close();
-                listenThread.interrupt();
-                listenThread = null;
+            if (null!=portListener) {
+                portListener.stopRequested = true;
+                portListener.socket.close();
+                portListener.interrupt();
+                portListener = null;
             }
             this.stopRequested = false;
         } catch (IOException e) {
@@ -143,7 +144,7 @@ public class RedisServer {
     }
 
     public boolean isStarted() {
-        return null!=listenThread && null!=listenThread.socket && listenThread.socket.isBound();
+        return null!=portListener && null!=portListener.socket && portListener.socket.isBound();
     }
 
     public boolean waitUntilListening() {
@@ -229,6 +230,19 @@ public class RedisServer {
                 }
                 catch (Exception e) {
                     logError(CN + ".onServerStarting: %s", e.getMessage());
+                }
+            }
+        }
+    }
+
+    protected void onStartFailed(String cause) {
+        synchronized (commandListeners) {
+            for (RedisListener l : commandListeners) {
+                try {
+                    l.onStartFailed(cause);
+                }
+                catch (Exception e) {
+                    logError(CN + ".onStartFailed: %s", e.getMessage());
                 }
             }
         }
@@ -423,7 +437,7 @@ public class RedisServer {
                 if (stopRequested) {
                     return;
                 }
-                else if (null!=listenThread && listenThread.isBound()) {
+                else if (null!=portListener && portListener.isBound()) {
                     onServerStarted("STARTED");
                     return;
                 }
@@ -445,16 +459,22 @@ public class RedisServer {
             return null!=socket && socket.isBound();
         }
 
-        public PortListener(int port) {
+        public PortListener(int port) throws BindException {
 
             super.setDaemon(true);
 
             this.port = port;
             try {
-                socket  = createServerSocket(port);
+                socket   = createServerSocket(port);
                 executor = createExecutor();
-            } catch (IOException e) {
-                throw new RuntimeException("Port " + port + ": " + e.getMessage(), e);
+            }
+            catch (BindException e) {
+                throw e;
+            }
+            catch (IOException e) {
+                String cause = "Port " + port + ": " + e.getMessage();
+                onStartFailed(cause);
+                throw new RuntimeException(cause, e);
             }
         }
 
@@ -1163,7 +1183,7 @@ public class RedisServer {
             Database db = getSelectedDb().markDirty();
             Object item = null;
             boolean expired = false;
-            for (;!listenThread.stopRequested && !expired;) {
+            for (;!portListener.stopRequested && !expired;) {
 
                 for (int i=0, len=args.size()-1; i<len; i++) {
 
@@ -1191,7 +1211,7 @@ public class RedisServer {
                         expired = true;
                     }
 
-                    if (listenThread.stopRequested || expired) {
+                    if (portListener.stopRequested || expired) {
                         break;
                     }
 
@@ -2140,6 +2160,8 @@ public class RedisServer {
          */
         public void onServerStarting(int port);
 
+        public void onStartFailed(String cause);
+
         public void onLoadingComplete(int dbCount);
 
         public void onSaving(int dbNumber, int keyCount, File dest);
@@ -2208,7 +2230,7 @@ public class RedisServer {
     protected Map<Integer, Database> databases;
     protected int port;
     protected Persistifier persistifier;
-    protected PortListener listenThread;
+    protected PortListener portListener;
     protected StartupThread startupThread;
 
     protected int threadPoolSize = DEFAULT_THREAD_POOL_SIZE;
