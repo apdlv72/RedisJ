@@ -1,0 +1,241 @@
+APPEND key value Append a value to a key
+AUTH password Authenticate to the server
+BGREWRITEAOF Asynchronously rewrite the append-only file
+BGSAVE Asynchronously save the dataset to disk
+BITCOUNT key [start end] Count set bits in a string
+BITFIELD key [GET type offset] [SET type offset value] [INCRBY
+BITOP operation destkey key [key ...] Perform bitwise
+BITPOS key bit [start] [end] Find first bit set or clear in a
+BLPOP key [key ...] timeout Remove and get the first element in
+BRPOP key [key ...] timeout Remove and get the last element in
+BRPOPLPUSH source destination timeout Pop an element from a
+BZPOPMIN key [key ...] timeout Remove and return the member
+BZPOPMAX key [key ...] timeout Remove and return the member
+CLIENT ID Returns the client ID for the current connection
+CLIENT KILL [ip:port] [ID client-id] [TYPE
+CLIENT LIST [TYPE normal|master|replica|pubsub] Get the list of
+CLIENT GETNAME Get the current connection name
+CLIENT PAUSE timeout Stop processing commands from clients for
+CLIENT REPLY ON|OFF|SKIP Instruct the server whether to reply
+CLIENT SETNAME connection-name Set the current connection name
+CLIENT UNBLOCK client-id [TIMEOUT|ERROR] Unblock a client
+CLUSTER ADDSLOTS slot [slot ...] Assign new hash slots to
+CLUSTER BUMPEPOCH Advance the cluster config epoch
+CLUSTER COUNT-FAILURE-REPORTS node-id Return the number of
+CLUSTER COUNTKEYSINSLOT slot Return the number of local keys in
+CLUSTER DELSLOTS slot [slot ...] Set hash slots as unbound in
+CLUSTER FAILOVER [FORCE|TAKEOVER] Forces a replica to perform a
+CLUSTER FLUSHSLOTS Delete a node's own slots information
+CLUSTER FORGET node-id Remove a node from the nodes table
+CLUSTER GETKEYSINSLOT slot count Return local key names in the
+CLUSTER INFO Provides info about Redis Cluster node state
+CLUSTER KEYSLOT key Returns the hash slot of the specified key
+CLUSTER MEET ip port Force a node cluster to handshake with
+CLUSTER MYID Return the node id
+CLUSTER NODES Get Cluster config for the node
+CLUSTER REPLICATE node-id Reconfigure a node as a replica of
+CLUSTER RESET [HARD|SOFT] Reset a Redis Cluster node
+CLUSTER SAVECONFIG Forces the node to save cluster state on
+CLUSTER SET-CONFIG-EPOCH config-epoch Set the configuration
+CLUSTER SETSLOT slot IMPORTING|MIGRATING|STABLE|NODE [node-id]
+CLUSTER SLAVES node-id List replica nodes of the specified
+CLUSTER REPLICAS node-id List replica nodes of the specified
+CLUSTER SLOTS Get array of Cluster slot to node mappings
+COMMAND Get array of Redis command details
+COMMAND COUNT Get total number of Redis commands
+COMMAND GETKEYS Extract keys given a full Redis command
+COMMAND INFO command-name [command-name ...] Get array of
+CONFIG GET parameter Get the value of a configuration parameter
+CONFIG REWRITE Rewrite the configuration file with the in
+CONFIG SET parameter value Set a configuration parameter to the
+CONFIG RESETSTAT Reset the stats returned by INFO
+DBSIZE Return the number of keys in the selected database
+DEBUG OBJECT key Get debugging information about a key
+DEBUG SEGFAULT Make the server crash
+DECR key Decrement the integer value of a key by one
+DECRBY key decrement Decrement the integer value of a key by
+DEL key [key ...] Delete a key
+DISCARD Discard all commands issued after MULTI
+DUMP key Return a serialized version of the value stored at the
+ECHO message Echo the given string
+EVAL script numkeys key [key ...] arg [arg ...] Execute a Lua
+EVALSHA sha1 numkeys key [key ...] arg [arg ...] Execute a Lua
+EXEC Execute all commands issued after MULTI
+EXISTS key [key ...] Determine if a key exists
+EXPIRE key seconds Set a key's time to live in seconds
+EXPIREAT key timestamp Set the expiration for a key as a UNIX
+FLUSHALL [ASYNC] Remove all keys from all databases
+FLUSHDB [ASYNC] Remove all keys from the current database
+GEOADD key longitude latitude member [longitude latitude member
+GEOHASH key member [member ...] Returns members of a geospatial
+GEOPOS key member [member ...] Returns longitude and latitude
+GEODIST key member1 member2 [m|km|ft|mi] Returns the distance
+GEORADIUS key longitude latitude radius m|km|ft|mi [WITHCOORD]
+GEORADIUSBYMEMBER key member radius m|km|ft|mi [WITHCOORD]
+GET key Get the value of a key
+GETBIT key offset Returns the bit value at offset in the string
+GETRANGE key start end Get a substring of the string stored at
+GETSET key value Set the string value of a key and return its
+HDEL key field [field ...] Delete one or more hash fields
+HEXISTS key field Determine if a hash field exists
+HGET key field Get the value of a hash field
+HGETALL key Get all the fields and values in a hash
+HINCRBY key field increment Increment the integer value of a
+HINCRBYFLOAT key field increment Increment the float value of
+HKEYS key Get all the fields in a hash
+HLEN key Get the number of fields in a hash
+HMGET key field [field ...] Get the values of all the given
+HMSET key field value [field value ...] Set multiple hash
+HSET key field value [field value ...] Set the string value of
+HSETNX key field value Set the value of a hash field, only if
+HSTRLEN key field Get the length of the value of a hash field
+HVALS key Get all the values in a hash
+INCR key Increment the integer value of a key by one
+INCRBY key increment Increment the integer value of a key by
+INCRBYFLOAT key increment Increment the float value of a key
+INFO [section] Get information and statistics about the server
+LOLWUT [VERSION version] Display some computer art and the
+KEYS pattern Find all keys matching the given pattern
+LASTSAVE Get the UNIX time stamp of the last successful save
+LINDEX key index Get an element from a list by its index
+LINSERT key BEFORE|AFTER pivot element Insert an element
+LLEN key Get the length of a list
+LPOP key Remove and get the first element in a list
+LPUSH key element [element ...] Prepend one or multiple
+LPUSHX key element [element ...] Prepend an element to a list,
+LRANGE key start stop Get a range of elements from a list
+LREM key count element Remove elements from a list
+LSET key index element Set the value of an element in a list
+LTRIM key start stop Trim a list to the specified range
+MEMORY DOCTOR Outputs memory problems report
+MEMORY HELP Show helpful text about the different subcommands
+MEMORY MALLOC-STATS Show allocator internal stats
+MEMORY PURGE Ask the allocator to release memory
+MEMORY STATS Show memory usage details
+MEMORY USAGE key [SAMPLES count] Estimate the memory usage of
+MGET key [key ...] Get the values of all the given keys
+MIGRATE host port key|"" destination-db timeout [COPY]
+MODULE LIST List all modules loaded by the server
+MODULE LOAD path [ arg [arg ...]] Load a module
+MODULE UNLOAD name Unload a module
+MONITOR Listen for all requests received by the server in real
+MOVE key db Move a key to another database
+MSET key value [key value ...] Set multiple keys to multiple
+MSETNX key value [key value ...] Set multiple keys to multiple
+MULTI Mark the start of a transaction block
+OBJECT subcommand [arguments [arguments ...]] Inspect the
+PERSIST key Remove the expiration from a key
+PEXPIRE key milliseconds Set a key's time to live in
+PEXPIREAT key milliseconds-timestamp Set the expiration for a
+PFADD key element [element ...] Adds the specified elements to
+PFCOUNT key [key ...] Return the approximated cardinality of
+PFMERGE destkey sourcekey [sourcekey ...] Merge N different
+PING [message] Ping the server
+PSETEX key milliseconds value Set the value and expiration in
+PSUBSCRIBE pattern [pattern ...] Listen for messages published
+PUBSUB subcommand [argument [argument ...]] Inspect the state
+PTTL key Get the time to live for a key in milliseconds
+PUBLISH channel message Post a message to a channel
+PUNSUBSCRIBE [pattern [pattern ...]] Stop listening for
+QUIT Close the connection
+RANDOMKEY Return a random key from the keyspace
+READONLY Enables read queries for a connection to a cluster
+READWRITE Disables read queries for a connection to a cluster
+RENAME key newkey Rename a key
+RENAMENX key newkey Rename a key, only if the new key does not
+RESTORE key ttl serialized-value [REPLACE] [ABSTTL] [IDLETIME
+ROLE Return the role of the instance in the context of
+RPOP key Remove and get the last element in a list
+RPOPLPUSH source destination Remove the last element in a
+RPUSH key element [element ...] Append one or multiple
+RPUSHX key element [element ...] Append an element to a list,
+SADD key member [member ...] Add one or more members to a set
+SAVE Synchronously save the dataset to disk
+SCARD key Get the number of members in a set
+SCRIPT DEBUG YES|SYNC|NO Set the debug mode for executed
+SCRIPT EXISTS sha1 [sha1 ...] Check existence of scripts in
+SCRIPT FLUSH Remove all the scripts from the script cache.
+SCRIPT KILL Kill the script currently in execution.
+SCRIPT LOAD script Load the specified Lua script into the
+SDIFF key [key ...] Subtract multiple sets
+SDIFFSTORE destination key [key ...] Subtract multiple sets
+SELECT index Change the selected database for the current
+SET key value [EX seconds|PX milliseconds] [NX|XX] [KEEPTTL]
+SETBIT key offset value Sets or clears the bit at offset in
+SETEX key seconds value Set the value and expiration of a key
+SETNX key value Set the value of a key, only if the key does
+SETRANGE key offset value Overwrite part of a string at key
+SHUTDOWN [NOSAVE|SAVE] Synchronously save the dataset to disk
+SINTER key [key ...] Intersect multiple sets
+SINTERSTORE destination key [key ...] Intersect multiple sets
+SISMEMBER key member Determine if a given value is a member of
+SLAVEOF host port Make the server a replica of another
+REPLICAOF host port Make the server a replica of another
+SLOWLOG subcommand [argument] Manages the Redis slow queries
+SMEMBERS key Get all the members in a set
+SMOVE source destination member Move a member from one set to
+SORT key [BY pattern] [LIMIT offset count] [GET pattern [GET
+SPOP key [count] Remove and return one or multiple random
+SRANDMEMBER key [count] Get one or multiple random members
+SREM key member [member ...] Remove one or more members from a
+STRLEN key Get the length of the value stored in a key
+SUBSCRIBE channel [channel ...] Listen for messages published
+SUNION key [key ...] Add multiple sets
+SUNIONSTORE destination key [key ...] Add multiple sets and
+SWAPDB index1 index2 Swaps two Redis databases
+SYNC Internal command used for replication
+PSYNC replicationid offset Internal command used for
+TIME Return the current server time
+TOUCH key [key ...] Alters the last access time of a key(s).
+TTL key Get the time to live for a key
+TYPE key Determine the type stored at key
+UNSUBSCRIBE [channel [channel ...]] Stop listening for
+UNLINK key [key ...] Delete a key asynchronously in another
+UNWATCH Forget about all watched keys
+WAIT numreplicas timeout Wait for the synchronous replication
+WATCH key [key ...] Watch the given keys to determine
+ZADD key [NX|XX] [CH] [INCR] score member [score member ...]
+ZCARD key Get the number of members in a sorted set
+ZCOUNT key min max Count the members in a sorted set with
+ZINCRBY key increment member Increment the score of a member
+ZINTERSTORE destination numkeys key [key ...] [WEIGHTS weight
+ZLEXCOUNT key min max Count the number of members in a sorted
+ZPOPMAX key [count] Remove and return members with the highest
+ZPOPMIN key [count] Remove and return members with the lowest
+ZRANGE key start stop [WITHSCORES] Return a range of members
+ZRANGEBYLEX key min max [LIMIT offset count] Return a range of
+ZREVRANGEBYLEX key max min [LIMIT offset count] Return a range
+ZRANGEBYSCORE key min max [WITHSCORES] [LIMIT offset count]
+ZRANK key member Determine the index of a member in a sorted
+ZREM key member [member ...] Remove one or more members from a
+ZREMRANGEBYLEX key min max Remove all members in a sorted set
+ZREMRANGEBYRANK key start stop Remove all members in a sorted
+ZREMRANGEBYSCORE key min max Remove all members in a sorted
+ZREVRANGE key start stop [WITHSCORES] Return a range of
+ZREVRANGEBYSCORE key max min [WITHSCORES] [LIMIT offset count]
+ZREVRANK key member Determine the index of a member in a
+ZSCORE key member Get the score associated with the given
+ZUNIONSTORE destination numkeys key [key ...] [WEIGHTS weight
+SCAN cursor [MATCH pattern] [COUNT count] [TYPE type]
+SSCAN key cursor [MATCH pattern] [COUNT count] Incrementally
+HSCAN key cursor [MATCH pattern] [COUNT count] Incrementally
+ZSCAN key cursor [MATCH pattern] [COUNT count] Incrementally
+XINFO [CONSUMERS key groupname] [GROUPS key] [STREAM key]
+XADD key ID field value [field value ...] Appends a new entry
+XTRIM key MAXLEN [~] count Trims the stream to (approximately
+XDEL key ID [ID ...] Removes the specified entries from the
+XRANGE key start end [COUNT count] Return a range of elements
+XREVRANGE key end start [COUNT count] Return a range of
+XLEN key Return the number of entires in a stream
+XREAD [COUNT count] [BLOCK milliseconds] STREAMS key [key ...]
+XGROUP [CREATE key groupname id-or-$] [SETID key groupname
+XREADGROUP GROUP group consumer [COUNT count] [BLOCK
+XACK key group ID [ID ...] Marks a pending message as
+XCLAIM key group consumer min-idle-time ID [ID ...] [IDLE ms]
+XPENDING key group [start end count] [consumer] Return
+LATENCY DOCTOR Return a human readable latency analysis
+LATENCY GRAPH event Return a latency graph for the event.
+LATENCY HISTORY event Return timestamp-latency samples for the
+LATENCY LATEST Return the latest latency samples for all
+LATENCY RESET [event] Reset latency data for one or more
+LATENCY HELP Show helpful text about the different

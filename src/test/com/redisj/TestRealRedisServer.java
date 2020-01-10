@@ -6,10 +6,12 @@ import static org.junit.Assert.fail;
 import java.io.IOException;
 
 import org.junit.AfterClass;
+import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
 import redis.clients.jedis.Jedis;
+import redis.clients.jedis.exceptions.JedisDataException;
 
 public class TestRealRedisServer extends TestRedisServer {
 
@@ -27,6 +29,14 @@ public class TestRealRedisServer extends TestRedisServer {
         }
     }
 
+    @Override
+    @Before
+    public void setUp() {
+        if (null==client) {
+            client = new Jedis("127.0.0.1", PORT, 60*1000);
+        }
+    }
+
     @AfterClass
     public static void tearDownAfterClass() {
         client.close();
@@ -34,8 +44,16 @@ public class TestRealRedisServer extends TestRedisServer {
 
     @Test
     public void testAuth() {
-        String rc = client.auth("password");
-        assertEquals("OK", rc);
+        try {
+            String rc = client.auth("password");
+            assertEquals("OK", rc);
+        }
+        catch (JedisDataException e) {
+            String msg = e.getMessage();
+            assertEquals("ERR Client sent AUTH, but no password is set", msg);
+        }
+        client.close();
+        client = null;
     }
 
     @Test
@@ -44,8 +62,16 @@ public class TestRealRedisServer extends TestRedisServer {
         assertEquals("OK", rc);
     }
 
+    @Test
     public void testSwapDb() {
-        String rc = client.swapDB(0, 1);
-        assertEquals("OK", rc);
+        try {
+            String rc = client.swapDB(0, 1);
+            assertEquals("OK", rc);
+        }
+        catch (JedisDataException e) {
+            String msg = e.getMessage();
+            assertEquals("ERR unknown command 'SWAPDB'", msg);
+        }
     }
+
 }

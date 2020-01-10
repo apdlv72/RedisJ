@@ -21,6 +21,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
@@ -30,6 +31,8 @@ import java.util.TreeSet;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.regex.Pattern;
+
+import com.redisj.RedisServer.Worker;
 
 /**
  *
@@ -45,11 +48,34 @@ import java.util.regex.Pattern;
  */
 public class RedisServer {
 
+    public static void main(String[] args) throws IOException {
+        RedisServer server = new RedisServer().withPersistence();
+        try {
+            server.serveForEver(true);
+            boolean ok = server.waitUntilAcceptingConnection(5000);
+            if (ok) {
+                server.logInfo("Press enter to stop.");
+                @SuppressWarnings("unused")
+                int key = System.in.read();
+                System.exit(0);
+            }
+
+            server.logError("Timeout while waiting for server to accept connections");
+            System.exit(2);
+        }
+        catch (BindException e) {
+            server.logError("Failed to bind to port %d", server.port);
+            System.exit(1);
+        }
+    }
+
     public static final int DEFAULT_THREAD_POOL_SIZE = 20;
 
     public static final int DEFAULT_PORT = 6379;
 
     public static final int DEFAULT_MAX_DB = 16;
+
+    public static final String DEFAULT_WORKDIR = ".redisj";
 
     public RedisServer() {
         this(DEFAULT_PORT, DEFAULT_MAX_DB);
@@ -70,7 +96,7 @@ public class RedisServer {
     }
 
     public RedisServer withPersistence() {
-        this.persistDir = createTempDir();
+        this.persistDir = createWorkDir();
         return this;
     }
 
@@ -84,7 +110,12 @@ public class RedisServer {
         return this;
     }
 
-    public void serveForEver(boolean background) throws IOException {
+    public RedisServer withVersion(String majorMinorRelease) {
+        this.version = majorMinorRelease;
+        return this;
+    }
+
+    public RedisServer serveForEver(boolean background) throws BindException {
 
         synchronized (this) {
 
@@ -113,6 +144,8 @@ public class RedisServer {
 
             if (background) portListener.start(); else portListener.run();
         }
+
+        return this;
     }
 
     public void stop() {
@@ -135,7 +168,7 @@ public class RedisServer {
         }
     }
 
-    public void flush() {
+    public void flushAll() {
         synchronized (databases) {
 
             Set<Integer> dbs = new TreeSet<Integer>(databases.keySet());
@@ -166,6 +199,16 @@ public class RedisServer {
             catch (Exception e) {
                 try { Thread.sleep(100); } catch (InterruptedException e1) {}
             }
+        }
+        return false;
+    }
+
+    public boolean waitUntilAcceptingConnection(int timeoutMillis) {
+        for (long expires = now()+timeoutMillis; now()<expires; ) {
+            if (acceptingConnections) {
+                return true;
+            }
+            try { Thread.sleep(100); } catch (InterruptedException e1) {}
         }
         return false;
     }
@@ -387,28 +430,24 @@ public class RedisServer {
 
     }
 
-    protected static String createTempDir() {
+    protected static String createWorkDir() {
 
-        try {
-            final File temp = File.createTempFile("redisj", "");
+        final String userHome = System.getProperty("user.home");
+        final File workDir = new File(userHome, DEFAULT_WORKDIR);
+        workDir.mkdirs();
 
-            if (!(temp.delete())) {
-                throw new RuntimeException("Failed to delete file " + temp.getAbsolutePath());
-            }
-
-            if(!(temp.mkdir())) {
-                throw new RuntimeException("Failed to create folder " + temp.getAbsolutePath());
-            }
-
-            return temp.getAbsolutePath();
+        if (!workDir.isDirectory()) {
+            throw new RuntimeException(String.format("%s is not a directory", workDir));
         }
-        catch (Exception e) {
-            throw new RuntimeException(e);
+        else if (!workDir.canWrite()) {
+            throw new RuntimeException(String.format("%s is not a writable", workDir));
         }
+
+        return workDir.getAbsolutePath();
     }
 
-    protected boolean notExpired(Ageable ageable) {
-        return null!=ageable && (ageable.expires<0 || ageable.expires<now());
+    protected boolean notExpired(Ageable a) {
+        return null!=a && (a.expires<0 || a.expires<now());
     }
 
     protected long now() {
@@ -442,23 +481,38 @@ public class RedisServer {
 
         Method method = null;
         try {
-            method = Worker.class.getDeclaredMethod(name, Args.class);
+            method = Worker.class.getDeclaredMethod(name, Database.class, Args.class);
         }
         catch (Exception e) {
             return null;
         }
 
-        RedisCommand anno = null==method ? null : method.getAnnotation(RedisCommand.class);
+        CommandMethod anno = null==method ? null : method.getAnnotation(CommandMethod.class);
         if (null==anno) {
             return null;
         }
 
+        // If this server is supposed to stick to a given redis version,
+        // check if the respective command would be supported by this redis version.
+        if (version!=null) {
+            if (version.compareTo(anno.since())<1) {
+                return null;
+            }
+        }
+
         found = new WorkerMethod(name, anno, method);
-        methodCache.put(name, found);
+        synchronized (methodCache) {
+            methodCache.put(name, found);
+        }
         return found;
     }
 
     class StartupThread extends Thread {
+
+        public StartupThread() {
+            super(StartupThread.class.getSimpleName());
+            setDaemon(true);
+        }
 
         @Override
         public void run() {
@@ -487,15 +541,9 @@ public class RedisServer {
      */
     class PortListener extends Thread {
 
-        public boolean stopRequested;
-        protected volatile ServerSocket socket;
-
-        boolean isBound() {
-            return null!=socket && socket.isBound();
-        }
-
         public PortListener(int port) throws BindException {
 
+            super(PortListener.class.getSimpleName());
             super.setDaemon(true);
 
             this.port = port;
@@ -524,25 +572,33 @@ public class RedisServer {
             serve();
         }
 
+        public boolean isBound() {
+            return null!=socket && socket.isBound();
+        }
+
         protected void serve() {
 
             boolean first = true;
+
             while (!stopRequested && null!=socket) {
 
                 if (first) {
-                    first = false;
                     onServerStarting(port);
                 }
 
                 Socket clientSocket = null;
                 try {
+                    if (first) {
+                        logInfo("%s[%d]: accepting connections", CN, port);
+                        acceptingConnections = true;
+                    }
                     clientSocket = socket.accept();
 
                     totalConnectionsReceived++;
 
-                    Worker command = new Worker(clientSocket);
-                    executor.execute(command);
-                    connectedClients++;
+                    Worker worker = new Worker(clientSocket);
+                    workers.add(worker);
+                    executor.execute(worker);
                 }
                 catch (Exception e) {
 
@@ -562,6 +618,8 @@ public class RedisServer {
                         logError(CN + ".serve: %s %s", addr, e.getMessage());
                     }
                 }
+
+                first = false;
             }
 
             executor.shutdownNow();
@@ -572,21 +630,17 @@ public class RedisServer {
             onServerStopped(reason);
         }
 
+        protected volatile ServerSocket socket;
+        protected boolean stopRequested;
         protected int port;
-        private ExecutorService executor;
+        protected ExecutorService executor;
     }
 
     class WorkerMethod {
 
-        private int min;
-        private int max;
-        private int args;
-        private boolean even;
-        private boolean odd;
-
-        public WorkerMethod(String name, RedisCommand anno, Method method) {
+        public WorkerMethod(String name, CommandMethod anno, Method method) {
             this.name = name;
-            //this.anno = anno;
+            this.db   = anno.db();
             this.method = method;
             this.min  = anno.min();
             this.max  = anno.max();
@@ -621,11 +675,26 @@ public class RedisServer {
             return null;
         }
 
-        public void invoke(Worker worker, Args args) throws IllegalAccessException, IllegalArgumentException, InvocationTargetException {
-            method.invoke(worker, args);
+        void invoke(Worker worker, Args args) throws IllegalAccessException, IllegalArgumentException, InvocationTargetException {
+            Database db = null;
+            try {
+                if (this.db) {
+                    db = worker.getSelectedDb();
+                }
+                method.invoke(worker, db, args);
+            }
+            finally {
+                // TODO: unlock db
+            }
         }
 
         private String name;
+        private int min;
+        boolean db;
+        private int max;
+        private int args;
+        private boolean even;
+        private boolean odd;
         //private RedisCommand anno;
         private Method method;
     }
@@ -637,35 +706,41 @@ public class RedisServer {
      */
     class Worker implements Runnable {
 
+        private String lastCommand;
         public Worker(Socket clientSocket) {
             //super.setDaemon(true);
             this.socket = clientSocket;
+            this.started = now();
         }
 
         @Override
         public void run() {
 
-            boolean connected = socket.isConnected();
-            boolean closed = socket.isClosed();
-
-            do {
-                try {
-                    handleRequests();
-                } catch (IOException e) {
-                    logError(e.getMessage());
-                }
-                connected = null!=socket && socket.isConnected();
-                closed    = null!=socket && socket.isClosed();
-            }
-            while (null!=socket && connected && !closed);
-
             try {
-                if (null!=socket) {
-                    socket.close();
+                boolean connected = socket.isConnected();
+                boolean closed = socket.isClosed();
+
+                do {
+                    try {
+                        handleRequests();
+                    } catch (IOException e) {
+                        logError(e.getMessage());
+                    }
+                    connected = null!=socket && socket.isConnected();
+                    closed    = null!=socket && socket.isClosed();
                 }
-            } catch (IOException e) {
+                while (null!=socket && connected && !closed);
+
+                try {
+                    if (null!=socket) {
+                        socket.close();
+                    }
+                } catch (IOException e) {
+                }
             }
-            connectedClients--;
+            finally {
+                workers.remove(this);
+            }
         }
 
         public void handleRequests() throws IOException {
@@ -684,7 +759,9 @@ public class RedisServer {
                     commands++;
                 }
                 catch (SocketException e) {
-                    socket.close();
+                    if (null!=socket) {
+                        socket.close();
+                    }
                     list = null;
                 }
                 catch (Exception e) {
@@ -697,19 +774,16 @@ public class RedisServer {
                         String cmd  = (String) list.remove(0);
                         Args   args = list;
 
-                        int num = selectedDb;
                         if (!commandListeners.isEmpty()) {
                             Database db = getSelectedDb();
-                            int keys = db.size();
-                            onBeforeCommand(num, keys, cmd, args);
+                            onBeforeCommand(db.number, db.size(), cmd, args);
                         }
 
                         dispatchCommand(cmd, args);
 
                         if (!commandListeners.isEmpty()) {
                             Database db = getSelectedDb();
-                            int keys = db.size();
-                            onAfterCommand(num, keys, cmd, args);
+                            onAfterCommand(db.number, db.size(), cmd, args);
                         }
                     }
                     catch (RESPException e) {
@@ -721,13 +795,39 @@ public class RedisServer {
             }
             while (null!=list);
 
-            socket.close();
+            if (null!=socket) {
+                socket.close();
+            }
             socket = null;
+        }
+
+        public String getInfo() {
+            String addr = socket.getRemoteSocketAddress().toString();
+            if (addr.startsWith("/")) {
+                addr = addr.substring(1);
+            }
+            long id   = clientId();
+            int  fd   = socket.getLocalPort(); // no file descriptors in java
+            long age  = now()-started;
+            long idle = 0;
+            int  db   = selectedDb;
+
+            String flags = "N"; // TODO: what flag do exist?
+            String cmd   = null==lastCommand ? "" : lastCommand;
+            String name  = null==clientName ? "" : clientName;
+
+            String info = String.format(
+                    "id=%d addr=%s fd=%d name=%s age=%d idle=%d flags=%s db=%d sub=0 psub=0 multi=-1 qbuf=0 qbuf-free=32768 obl=0 oll=0 omem=0 events=r cmd=%s",
+                    id,    addr,   fd,   name,   age,   idle,   flags,   db, cmd
+                    );
+            return info;
         }
 
         protected void dispatchCommand(String cmd, Args args) throws IOException {
 
             try {
+                this.lastCommand = cmd;
+
                 WorkerMethod rm = findWorkerMethod(cmd);
                 if (null==rm) {
                     writer.sendError("WRONGCMD", "Unknown command '%s'", cmd);
@@ -765,158 +865,151 @@ public class RedisServer {
             }
         }
 
-        @RedisCommand(args = {"key", "field"})
-        protected void hstrlen(Args args) throws IOException {
-
-            String key   = args.get(0);
-            String field = args.get(1);
-
-            Database db = getSelectedDb();
-            synchronized (db) {
-                Ageable a = db.get(key, false);
-                if (null!=a) {
-                    Hash hash = (Hash) a.value;
-                    String value = hash.get(field);
-                    writer.sendNumber(value.length());
-                    return;
-                }
-                writer.sendNumber(-1);
+        @CommandMethod(args = {"db"}, since="1.0.0", db=false)
+        protected void select(Database db, Args args) throws IOException {
+            String num = args.get(0);
+            selectedDb = Integer.parseInt(num);
+            if (maxDb>-1 && selectedDb>=maxDb) {
+                writer.sendError("ERR", "Invalid database");
+            }
+            else {
+                writer.write("+OK\r\n".getBytes());
             }
         }
 
-        @RedisCommand(args = {"key", "field"})
-        protected void hget(Args args) throws IOException {
+        @CommandMethod(args = {}, since="1.0.0", ro=true)
+        protected void dbsize(Database db, Args args) throws IOException {
+            writer.sendNumber(db.size());
+        }
 
-            String key   = args.get(0);
-            String field = args.get(1);
-
-            Database db = getSelectedDb();
-            synchronized (db) {
-                Ageable a = db.get(key, false);
-                if (null!=a) {
-                    Hash hash = (Hash) a.value;
-                    String value = hash.get(field);
-                    writer.sendString(value);
-                    return;
-                }
-                writer.sendString(EMPTY_STRING);
+        @CommandMethod(args = {"[ASYNC]"}, min=0, max=1, since="1.0.0", db=false)
+        protected void flushall(Database db, Args args) throws IOException {
+            synchronized (databases) {
+                databases.clear();
             }
         }
 
-        @RedisCommand(args = {"key"})
-        protected void hgetall(Args args) throws IOException {
+        @CommandMethod(args = {"pattern"}, since="1.0.0", ro=true)
+        protected void keys(Database db, Args args) throws IOException {
 
+            String glob = args.get(0);
+
+            Pattern rex = createRegexFromGlob(glob);
+            ArrayList<String> matches = new ArrayList<String>();
+
+            for (String key : db.keySet()) {
+                if (rex.matcher(key).matches()) {
+                    matches.add(key);
+                }
+            }
+
+            writer.sendArray(matches);
+        }
+
+        @CommandMethod(args= {"key"}, since="1.0.0", ro=true)
+        protected void get(Database db, Args args) throws IOException {
             String key = args.get(0);
-
-            Database db = getSelectedDb();
-            synchronized (db) {
-                Ageable a = db.get(key, false);
-                List<String> list = new ArrayList<String>();
-                if (null!=a) {
-                    Hash hash = (Hash) a.value;
-
-                    for (Entry<String, String> entry : hash.entrySet()) {
-                        list.add(entry.getKey());
-                        list.add(entry.getValue());
-                    }
-                }
-                writer.sendArray(list);
+            Ageable a = db.get(key, false);
+            if (null==a) {
+                writer.write(EMPTY_BYTES);
             }
-        }
-
-        @RedisCommand(args = {"key", "field", "amount"})
-        protected void hincrby(Args args) throws IOException {
-
-            String key   = args.get(0);
-            String field = args.get(1);
-            long incr = Long.parseLong(args.get(2));
-
-            Database db = getSelectedDb();
-            synchronized (db) {
-                Ageable a = db.get(key, false);
-                Hash hash = null;
-                if (null==a) {
-                    db.put(key, new Ageable(hash = new Hash()));
-                }
-                else {
-                    hash = (Hash) a.value;
-                }
-
-                String value = hash.getOrDefault(field, "0");
-                long sum = Long.parseLong(value)+incr;
-                String string = ""+sum;
-                hash.put(field, string);
-                writer.sendNumber(sum);
-            }
-        }
-
-        @RedisCommand(args = {"key", "field", "amount"})
-        protected void hincrbyfloat(Args args) throws IOException {
-
-            String key   = args.get(0);
-            String field = args.get(1);
-            double incr = Double.parseDouble(args.get(2));
-
-            Database db = getSelectedDb();
-            synchronized (db) {
-                Ageable a = db.get(key, false);
-                Hash hash = null;
-                if (null==a) {
-                    db.put(key, new Ageable(hash = new Hash()));
-                }
-                else {
-                    hash = (Hash) a.value;
-                }
-
-                String value = hash.getOrDefault(field, "0");
-                double sum = Double.parseDouble(value)+incr;
-                String string = ""+sum;
-                hash.put(field, string);
+            else {
+                String string = a.get();
                 writer.sendString(string);
             }
         }
 
-        @RedisCommand(args = {"key", "field", "value"})
-        protected void hsetnx(Args args) throws IOException {
+        @CommandMethod(args= {"key"}, since="1.0.0", ro=true)
+        protected void exists(Database db, Args args) throws IOException {
             String key = args.get(0);
-            String field = args.get(1);
-            String value = args.get(2);
-            _hset(key, field, value, true);
+            Ageable a = db.get(key, false);
+            writer.sendNumber(null==a ? 0 : 1);
         }
 
-        @RedisCommand(args = {"key", "field", "value"})
-        protected void hset(Args args) throws IOException {
-            String key = args.get(0);
-            String field = args.get(1);
-            String value = args.get(2);
-            _hset(key, field, value, false);
-        }
-
-        @RedisCommand(args = {"key", "field"})
-        protected void hexists(Args args) throws IOException {
+        @CommandMethod(args= {"key"}, since="2.6.0")
+        protected void bitcount(Database db, Args args) throws IOException {
 
             String key = args.get(0);
-            String field = args.get(1);
-
-            Database db = getSelectedDb();
-            synchronized (db) {
-                Ageable a = db.get(key, false);
-                if (null!=a) {
-                    Hash h = (Hash) a.value;
-                    if (h.containsKey(field)) {
-                        writer.sendNumber(1);
-                        return;
-                    }
+            int count = 0;
+            Ageable a = db.get(key, false);
+            if (null!=a) {
+                String s = a.get();
+                for (int i=0, len=s.length(); i<len; i++) {
+                    char c = s.charAt(i);
+                    int upper = ((byte)c) >> 4;
+                    int lower = ((byte)c) & 0x0f;
+                    count += NIBBLE_BITS[upper] + NIBBLE_BITS[lower];
                 }
-                writer.sendNumber(0);
+            }
+            writer.sendNumber(count);
+        }
+
+        @CommandMethod(args= {"key", "offset"}, since="2.2.0", ro=true)
+        protected void getbit(Database db, Args args) throws IOException {
+
+            String key = args.get(0);
+            int value = 0;
+            Ageable a = db.get(key, false);
+            if (null!=a) {
+                String s = a.get();
+                int off = Integer.parseInt(args.get(1));
+                int pos = off/8;
+                char c = (null==s || pos>=s.length()) ? 0 : s.charAt(pos);
+                byte mask = (byte)(0x80 >> (off%8));
+                if ((mask & c) > 0) {
+                    value = 1;
+                }
+            }
+            writer.sendNumber(value);
+        }
+
+        @CommandMethod(args = {"key", "value"}, since="1.0.0")
+        protected void set(Database db, Args args) throws IOException {
+            _set(db, args, false);
+        }
+
+        @CommandMethod(args = {"key", "value"}, since="1.0.0")
+        protected void setnx(Database db, Args args) throws IOException {
+            _set(db, args, true);
+        }
+
+        @CommandMethod(args = {"key", "value"}, since="2.0.0")
+        protected void append(Database db, Args args) throws IOException {
+            String key = args.get(0);
+            String value = args.get(1);
+            Ageable a = db.get(key, false);
+            long len = 0;
+            if (null==a) {
+                db.put(key, new Ageable(value));
+                len = value.length();
+            }
+            else {
+                String s = a.value.toString() + value;
+                a.value = s;
+                len = s.length();
+            }
+            writer.sendNumber(len);
+        }
+
+        @CommandMethod(args = {"key1", "key2", "..."}, min=1, since="1.0.0", ro=true)
+        protected void mget(Database db, Args args) throws IOException {
+            writer.sendArrayLength(args.size());
+            for (String key : args) {
+                Ageable a = db.get(key, false);
+                if (null==a) {
+                    writer.write(EMPTY_BYTES);
+                }
+                else {
+                    String string = a.get();
+                    writer.sendString(string);
+                }
             }
         }
 
-        @RedisCommand(args = {"key"})
-        protected void llen(Args args) throws IOException {
+        @CommandMethod(args = {"key"}, since="1.0.0", ro=true)
+        protected void llen(Database db, Args args) throws IOException {
 
             String key = args.get(0);
-            Database db = getSelectedDb();
             Ageable a = db.get(key, false);
             if (null==a) {
                 writer.sendNumber(0);
@@ -927,45 +1020,39 @@ public class RedisServer {
             }
         }
 
-        @RedisCommand(args = {"key"})
-        protected void lpop(Args args) throws IOException {
+        @CommandMethod(args = {"key"}, since="1.0.0")
+        protected void lpop(Database db, Args args) throws IOException {
             String key = args.get(0);
-            _pop(key, true);
+            _pop(db, key, true);
         }
 
-        @RedisCommand(args = {"key"})
-        protected void rpop(Args args) throws IOException {
+        @CommandMethod(args = {"key"}, since="1.0.0")
+        protected void rpop(Database db, Args args) throws IOException {
             String key = args.get(0);
-            _pop(key, false);
+            _pop(db, key, false);
         }
 
-        @RedisCommand(args = {"key", "value"})
-        protected void rpushx(String cmd) throws IOException {
-            _todo(cmd);
-        }
-
-        @RedisCommand(args = {"key", "value"})
-        protected void rpush(Args args) throws IOException {
+        @CommandMethod(args = {"key", "value"}, since="1.0.0")
+        protected void rpush(Database db, Args args) throws IOException {
             String key   = args.get(0);
             String value = args.get(1);
-            _push(key, value, false);
+            _push(db, key, value, false);
         }
 
-        @RedisCommand(args = {"key", "value"})
-        protected void lpush(Args args) throws IOException {
+        @CommandMethod(args = {"key", "value"}, since="1.0.0")
+        protected void lpush(Database db, Args args) throws IOException {
             String key   = args.get(0);
             String value = args.get(1);
-            _push(key, value, true);
+            _push(db, key, value, true);
         }
 
-        @RedisCommand(args = {"key"})
-        protected void type(Args args) throws IOException {
+        @CommandMethod(args = {"key"}, since="1.0.0", ro=true)
+        protected void type(Database db, Args args) throws IOException {
 
             String key = args.get(0);
-
-            Ageable ageable = getSelectedDb().get(key, false);
-            if (notExpired(ageable)) {
-                Object value = ageable.value;
+            Ageable a = db.get(key, false);
+            if (notExpired(a)) {
+                Object value = a.value;
                 if (value instanceof String) {
                     writer.write("+string\r\n".getBytes());
                 }
@@ -990,179 +1077,112 @@ public class RedisServer {
             }
         }
 
-        @RedisCommand(args = {"key", "amout"})
-        protected void decrbyfloat(Args args) throws IOException {
-            _incrDecr(args.get(0), false, args.get(1), true);
+        @CommandMethod(args = {"key", "amout"}, since="2.6.0")
+        protected void incrbyfloat(Database db, Args args) throws IOException {
+            _incrDecr(db, args.get(0), true, args.get(1), true);
         }
 
-        @RedisCommand(args = {"key", "amout"})
-        protected void incrbyfloat(Args args) throws IOException {
-            _incrDecr(args.get(0), true, args.get(1), true);
+        @CommandMethod(args = {"key", "amout"}, since="1.0.0")
+        protected void decrby(Database db, Args args) throws IOException {
+            _incrDecr(db, args.get(0), false, args.get(1), false);
         }
 
-        @RedisCommand(args = {"key", "amout"})
-        protected void decrby(Args args) throws IOException {
-            _incrDecr(args.get(0), false, args.get(1), false);
+        @CommandMethod(args = {"key", "amout"}, since="1.0.0")
+        protected void incrby(Database db, Args args) throws IOException {
+            _incrDecr(db, args.get(0), true, args.get(1), false);
         }
 
-        @RedisCommand(args = {"key", "amout"})
-        protected void incrby(Args args) throws IOException {
-            _incrDecr(args.get(0), true, args.get(1), false);
+        @CommandMethod(args = {"key"}, since="1.0.0")
+        protected void decr(Database db, Args args) throws IOException {
+            _incrDecr(db, args.get(0), false, "1", false);
         }
 
-        @RedisCommand(args = {"key"})
-        protected void decr(Args args) throws IOException {
-            _incrDecr(args.get(0), false, "1", false);
+        @CommandMethod(args = {"key"}, since="1.0.0")
+        protected void incr(Database db, Args args) throws IOException {
+            _incrDecr(db, args.get(0), true, "1", false);
         }
 
-        @RedisCommand(args = {"key"})
-        protected void incr(Args args) throws IOException {
-            _incrDecr(args.get(0), true, "1", false);
-        }
-
-        @RedisCommand(args = {"db"})
-        protected void select(Args args) throws IOException {
-            String num = args.get(0);
-            selectedDb = Integer.parseInt(num);
-            if (maxDb>-1 && selectedDb>=maxDb) {
-                writer.sendError("ERR", "Invalid database");
-            }
-            else {
-                writer.write("+OK\r\n".getBytes());
-            }
-        }
-
-        @RedisCommand(args = {"pattern"})
-        protected void keys(Args args) throws IOException {
-
-            String glob = args.get(0);
-
-            Pattern rex = createRegexFromGlob(glob);
-            ArrayList<String> matches = new ArrayList<String>();
-
-            StringBuilder sb = new StringBuilder();
-            Database db = getSelectedDb();
-            for (String key : db.keySet()) {
-                if (rex.matcher(key).matches()) {
-                    matches.add(key);
-                }
-            }
-
-            sb.append("*").append(matches.size()).append(CRLF_STRING);
-            for (String key : matches) {
-                sb.append("$").append(key.length()).append(CRLF_STRING);
-                sb.append(key).append(CRLF_STRING);
-            }
-
-            String string = sb.toString();
-            writer.write(string.getBytes());
-        }
-
-        @RedisCommand(args= {"key"})
-        protected void get(Args args) throws IOException {
-
-            String key = args.get(0);
-
-            Database db = getSelectedDb();
-            Ageable ageable = db.get(key, false);
-            if (null==ageable) {
-                writer.write(EMPTY_BYTES);
-            }
-            else {
-                String string = (String) ageable.value;
-                writer.sendString(string);
-            }
-        }
-
-        @RedisCommand(args = {"key", "value"})
-        protected void set(Args args) throws IOException {
-            _set(args, false);
-        }
-
-        @RedisCommand(args = {"key", "value"})
-        protected void setnx(Args args) throws IOException {
-            _set(args, true);
-        }
-
-        @RedisCommand(args = {"key", "value"})
-        protected void append(Args args) throws IOException {
-
-            String key = args.get(0);
-            String value = args.get(1);
-
-            Database db = getSelectedDb().markDirty();
-
-            Ageable a = db.get(key, false);
-            long len = 0;
-            if (null==a) {
-                db.put(key, new Ageable(value));
-                len = value.length();
-            }
-            else {
-                String s = a.value.toString() + value;
-                a.value = s;
-                len = s.length();
-            }
-            writer.sendNumber(len);
-        }
-
-        @RedisCommand(args = {"key1", "key2", "..."}, min=1)
-        protected void mget(Args args) throws IOException {
-
-            Database db = getSelectedDb();
-            writer.sendArrayLength(args.size());
-
-            for (String key : args) {
-                Ageable ageable = db.get(key, false);
-                if (null==ageable) {
-                    writer.write(EMPTY_BYTES);
-                }
-                else {
-                    writer.sendString(ageable.value.toString());
-                }
-            }
-        }
-
-        @RedisCommand(args = {"subcmd", "[option]"}, min=1, max=2)
-        protected void client(Args args) throws IOException {
-
+        @CommandMethod(args = {"subcmd", "[option]"}, min=1, max=2, since="2.4.0")
+        protected void client(Database db, Args args) throws IOException {
             String subcmd = args.get(0).toUpperCase();
-
             if ("ID".equals(subcmd)) {
-                writer.sendString(clientId);
+                // since="5.0.0"
+                writer.sendString(""+clientId());
             }
             else if ("LIST".equals(subcmd)) {
-                writer.sendString("unsupported");
+                // 2.4.0
+                StringBuilder sb = new StringBuilder();
+                synchronized (workers) {
+                    for (Worker w : workers) {
+                        sb.append(w.getInfo()).append("\r\n");
+                    }
+                }
+                writer.sendString(sb.toString());
             }
             else if ("KILL".equals(subcmd)) {
-                writer.sendString("unsupported");
+                // 2.4.0
+                String ipPort = args.get(1);
+                synchronized (workers) {
+                    for (Worker w : workers) {
+                        if (w.hasAddr(ipPort)) {
+                            w.kill();
+                            break;
+                        }
+                    }
+                }
+            }
+            else if ("GETNAME".equals(subcmd)) {
+                // 2.6.9
+                writer.sendString(clientName);
             }
             else if ("SETNAME".equals(subcmd)) {
+                // 2.6.9
                 assertArgCount(args, 2);
                 clientName = args.get(1);
                 writer.write(OK_BYTES);
             }
-            else if ("GETNAME".equals(subcmd)) {
-                writer.sendString(clientName);
+            else if ("PAUSE".equals(subcmd)) {
+                // 2.9.50
+                _todo("client PAUSE");
+            }
+            else if ("REPLY".equals(subcmd)) {
+                // 3.2.
+                _todo("client REPLY");
+            }
+            else if ("UNBLOCK".equals(subcmd)) {
+                // 5.0.0.
+                _todo("client UNBLOCK");
             }
             else {
-                writer.sendError("ERR", "Invalid command");
+                writer.sendError("ERR", "(error) ERR Syntax error, try CLIENT (ID | LIST | KILL ip:port | GETNAME | SETNAME connection-name)");
             }
         }
 
-        @RedisCommand(args = {"message"})
-        protected void echo(Args args) throws IOException {
-
+        @CommandMethod(args = {"message"}, since="1.0.0", ro=true)
+        protected void echo(Database db, Args args) throws IOException {
             String message = args.get(0);
             writer.sendString(message);
         }
 
-        @RedisCommand(args = {"key", "field1", "field2", "field3", "..."}, min=2)
-        protected void hmget(Args args) throws IOException {
-
+        @CommandMethod(args = {"key", "field", "value"}, since="2.0.0")
+        protected void hset(Database db, Args args) throws IOException {
             String key = args.get(0);
-            Database db = getSelectedDb();
+            String field = args.get(1);
+            String value = args.get(2);
+            _hset(db, key, field, value, false);
+        }
 
+        @CommandMethod(args = {"key", "field", "value"}, since="2.0.0")
+        protected void hsetnx(Database db, Args args) throws IOException {
+            String key = args.get(0);
+            String field = args.get(1);
+            String value = args.get(2);
+            _hset(db, key, field, value, true);
+        }
+
+        @CommandMethod(args = {"key", "field1", "field2", "field3", "..."}, min=2, since="2.0.0", ro=true)
+        protected void hmget(Database db, Args args) throws IOException {
+            String key = args.get(0);
             synchronized (db) {
                 Ageable a = db.get(key, false);
                 List<String> list = new ArrayList<String>();
@@ -1177,12 +1197,9 @@ public class RedisServer {
             }
         }
 
-        @RedisCommand(args = {"key", "field1", "value1", "field2", "value2", "..."}, odd=true, min=3)
-        protected void hmset(Args args) throws IOException {
-
-            String   key = args.get(0);
-            Database db  = getSelectedDb();
-
+        @CommandMethod(args = {"key", "field1", "value1", "field2", "value2", "..."}, odd=true, min=3, since="2.0.0")
+        protected void hmset(Database db, Args args) throws IOException {
+            String key = args.get(0);
             synchronized (db) {
                 Ageable a = db.get(key, false);
                 Hash hash = null;
@@ -1201,11 +1218,9 @@ public class RedisServer {
             }
         }
 
-        @RedisCommand(args = {"key"})
-        protected void hkeys(Args args) throws IOException {
-
-            String key  = args.get(0);
-            Database db = getSelectedDb();
+        @CommandMethod(args = {"key"}, since="2.0.0", ro=true)
+        protected void hkeys(Database db, Args args) throws IOException {
+            String key = args.get(0);
             synchronized (db) {
                 Ageable a = db.get(key, false);
                 List<String> list = new ArrayList<String>();
@@ -1219,11 +1234,9 @@ public class RedisServer {
             }
         }
 
-        @RedisCommand(args = {"key"})
-        protected void hvals(Args args) throws IOException {
-
-            String key  = args.get(0);
-            Database db = getSelectedDb();
+        @CommandMethod(args = {"key"}, since="2.0.0", ro=true)
+        protected void hvals(Database db, Args args) throws IOException {
+            String key = args.get(0);
             synchronized (db) {
                 Ageable a = db.get(key, false);
                 List<String> list = new ArrayList<String>();
@@ -1237,11 +1250,27 @@ public class RedisServer {
             }
         }
 
-        @RedisCommand(args = {"key"})
-        protected void hlen(Args args) throws IOException {
+        @CommandMethod(args = {"key", "field1", "field2", "..."}, min=2, since="2.0.0")
+        protected void hdel(Database db, Args args) throws IOException {
 
-            String key  = args.get(0);
-            Database db = getSelectedDb();
+            Ageable a = db.get(args.key(), false);
+            if (null!=a) {
+                Hash hash = (Hash) a.value;
+                int count = 0;
+                for (int i=1; i<args.size(); i++) {
+                    String field = args.get(i);
+                    if (hash.contains(field)) {
+                        hash.remove(field);
+                        count++;
+                    }
+                }
+                writer.sendNumber(count);
+            }
+        }
+
+        @CommandMethod(args = {"key"}, since="2.0.0", ro=true)
+        protected void hlen(Database db, Args args) throws IOException {
+            String key = args.get(0);
             synchronized (db) {
                 Ageable a = db.get(key, false);
                 if (null!=a) {
@@ -1254,8 +1283,93 @@ public class RedisServer {
             }
         }
 
-        @RedisCommand(args = {})
-        protected void save(Args args) throws IOException {
+        @CommandMethod(args = {"key", "field"}, since="3.2.0", ro=true)
+        protected void hstrlen(Database db, Args args) throws IOException {
+
+            String key   = args.get(0);
+            String field = args.get(1);
+
+            synchronized (db) {
+                Ageable a = db.get(key, false);
+                if (null!=a) {
+                    Hash hash = (Hash) a.value;
+                    String value = hash.get(field);
+                    writer.sendNumber(value.length());
+                    return;
+                }
+                writer.sendNumber(-1);
+            }
+        }
+
+        @CommandMethod(args = {"key", "field"}, since="2.0.0", ro=true)
+        protected void hget(Database db, Args args) throws IOException {
+
+            String key   = args.get(0);
+            String field = args.get(1);
+
+            synchronized (db) {
+                Ageable a = db.get(key, false);
+                if (null!=a) {
+                    Hash hash = (Hash) a.value;
+                    String value = hash.get(field);
+                    writer.sendString(value);
+                    return;
+                }
+                writer.sendString(EMPTY_STRING);
+            }
+        }
+
+        @CommandMethod(args = {"key"}, since="2.0.0", ro=true)
+        protected void hgetall(Database db, Args args) throws IOException {
+
+            String key = args.get(0);
+
+            synchronized (db) {
+                Ageable a = db.get(key, false);
+                List<String> list = new ArrayList<String>();
+                if (null!=a) {
+                    Hash hash = (Hash) a.value;
+
+                    for (Entry<String, String> entry : hash.entrySet()) {
+                        list.add(entry.getKey());
+                        list.add(entry.getValue());
+                    }
+                }
+                writer.sendArray(list);
+            }
+        }
+
+        @CommandMethod(args = {"key", "field", "amount"}, since="2.0.0")
+        protected void hincrby(Database db, Args args) throws IOException {
+            _hincrBy(db, args, false);
+        }
+
+        @CommandMethod(args = {"key", "field", "amount"}, since="2.6.0")
+        protected void hincrbyfloat(Database db, Args args) throws IOException {
+            _hincrBy(db, args, true);
+        }
+
+        @CommandMethod(args = {"key", "field"}, since="2.0.0", ro=true)
+        protected void hexists(Database db, Args args) throws IOException {
+
+            String key = args.get(0);
+            String field = args.get(1);
+
+            synchronized (db) {
+                Ageable a = db.get(key, false);
+                if (null!=a) {
+                    Hash h = (Hash) a.value;
+                    if (h.containsKey(field)) {
+                        writer.sendNumber(1);
+                        return;
+                    }
+                }
+                writer.sendNumber(0);
+            }
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void save(Database db, Args args) throws IOException {
 
             Persistifier pers = new Persistifier(RedisServer.this, "/tmp/radisj");
             pers.persist(databases);
@@ -1263,48 +1377,46 @@ public class RedisServer {
             writer.write(OK_BYTES);
         }
 
-        @RedisCommand(args = {})
-        protected void ping(Args args) throws IOException {
+        @CommandMethod(args = {}, min=0, max=1, since="1.0.0", ro=true)
+        protected void ping(Database db, Args args) throws IOException {
             writer.sendString("PONG");
         }
 
-        @RedisCommand(args = {"key1", "key2", "...", "timeout"}, min=2)
-        protected void blpop(Args args) throws IOException {
-            _bpop(true, args);
+        @CommandMethod(args = {"key1", "key2", "...", "timeout"}, min=2, since="2.0.0")
+        protected void blpop(Database db, Args args) throws IOException {
+            _bpop(db, true, args);
         }
 
-        @RedisCommand(args = {"key"})
-        protected void brpop(Args args) throws IOException {
-            _bpop(false, args);
+        @CommandMethod(args = {"key"}, since="2.0.0")
+        protected void brpop(Database db, Args args) throws IOException {
+            _bpop(db, false, args);
         }
 
-        @RedisCommand(args={"key"})
-        protected void del(Args args) throws IOException {
+        @CommandMethod(args={"key"}, min=1, since="1.0.0")
+        protected void del(Database db, Args args) throws IOException {
             String key = args.get(0);
-            Ageable ageable = getSelectedDb().markDirty().remove(key);
-            writer.sendNumber(notExpired(ageable) ? 1 : 0);
+            Ageable a = db.markDirty().remove(key);
+            writer.sendNumber(notExpired(a) ? 1 : 0);
         }
 
-        @RedisCommand(args = {})
-        protected void flushdb(Args args) throws IOException {
-            getSelectedDb().markDirty().clear();
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void flushdb(Database db, Args args) throws IOException {
+            db.markDirty().clear();
             writer.write(OK_BYTES);
         }
 
-        @RedisCommand(args = {"key"})
-        protected void ttl(Args args) throws IOException {
+        @CommandMethod(args = {"key"}, since="1.0.0", ro=true)
+        protected void ttl(Database db, Args args) throws IOException {
 
             String key = args.get(0);
-            Database db = getSelectedDb();
             long ttl = -2;
-
-            Ageable ageable = db.get(key, false);
-            if (notExpired(ageable)) {
-                if (ageable.expires<0) {
+            Ageable a = db.get(key, false);
+            if (notExpired(a)) {
+                if (a.expires<0) {
                     ttl = -1;
                 }
                 else {
-                    ttl = (now()-ageable.expires)/1000;
+                    ttl = (now()-a.expires)/1000;
                 }
             }
             else {
@@ -1314,48 +1426,98 @@ public class RedisServer {
             writer.sendNumber(ttl);
         }
 
-        @RedisCommand(args = {"key", "ttl"})
-        protected void expire(Args args) throws IOException {
+        @CommandMethod(args = {"key"}, since="2.6.0", ro=true)
+        protected void pttl(Database db, Args args) throws IOException {
 
             String key = args.get(0);
-            String ttl = args.get(1);
+            long ttl = -2;
+            Ageable a = db.get(key, false);
+            if (notExpired(a)) {
+                if (a.expires<0) {
+                    ttl = -1;
+                }
+                else {
+                    ttl = (now()-a.expires);
+                }
+            }
+            else {
+                ttl = -2;
+            }
 
-            Database db = getSelectedDb().markDirty();
-            int seconds = Integer.parseInt(ttl);
+            writer.sendNumber(ttl);
+        }
 
-            Ageable ageable = db.get(key, false);
-            if (notExpired(ageable)) {
-                ageable.expires = now()+1000*seconds;
-                //output.write(":0\r\n".getBytes());
+        @CommandMethod(args = {"key", "ttl"}, since="1.0.0")
+        protected void expire(Database db, Args args) throws IOException {
+            String key  = args.get(0);
+            String ttl  = args.get(1);
+            int    secs = Integer.parseInt(ttl);
+            Ageable a = db.get(key, false);
+            if (notExpired(a)) {
+                a.expires = now()+1000*secs;
                 writer.sendNumber(0);
             }
             else {
-                //output.write(":1\r\n".getBytes());
                 writer.sendNumber(1);
             }
         }
 
-        @RedisCommand(args = {"key1", "val1", "key2", "val2"}, min=2, even=true)
-        protected void mset(Args args) throws IOException {
-            _mset(args, false);
+        @CommandMethod(args = {"key", "ttl"}, since="1.0.0")
+        protected void setex(Database db, Args args) throws IOException {
+            String key   = args.get(0);
+            int    secs  = Integer.parseInt(args.get(1));
+            String value = args.get(2);
+            Ageable a = db.get(key, false);
+            if (null==a) {
+                db.put(key, a = new Ageable(value));
+                a.expires = now()+1000*secs;
+                writer.sendNumber(1);
+            }
+            else {
+                writer.sendNumber(0);
+            }
         }
 
-        @RedisCommand(args = {"key1", "val1", "key2", "val2"}, min=2, even=true)
-        protected void msetnx(Args args) throws IOException {
-            _mset(args, true);
+        @CommandMethod(args = {"key", "ttl"}, since="1.0.0")
+        protected void psetex(Database db, Args args) throws IOException {
+            String key   = args.get(0);
+            int    millis  = Integer.parseInt(args.get(1));
+            String value = args.get(2);
+            Ageable a = db.get(key, false);
+            if (null==a) {
+                db.put(key, a = new Ageable(value));
+                a.expires = now()+millis;
+                writer.sendNumber(1);
+            }
+            else {
+                writer.sendNumber(0);
+            }
         }
 
-        @RedisCommand(args = {})
-        protected void info(Args args) throws IOException {
+        @CommandMethod(args = {"key1", "val1", "key2", "val2"}, min=2, even=true, since="1.0.1")
+        protected void mset(Database db, Args args) throws IOException {
+            _mset(db, args, false);
+        }
+
+        @CommandMethod(args = {"key1", "val1", "key2", "val2"}, min=2, even=true, since="1.0.1")
+        protected void msetnx(Database db, Args args) throws IOException {
+            _mset(db, args, true);
+        }
+
+        @CommandMethod(args = {}, db=false, since="1.0.0", ro=true)
+        protected void info(Database unused, Args args) throws IOException {
 
             StringBuilder sb = new StringBuilder();
 
-            long uptime_in_seconds = (now()-startTime)/1000;
+            long uptimeSeconds = (now()-startTime)/1000;
+            int connectedClients = workers.size();
 
             sb.append("# Server\r\n");
-            sb.append("redis_version:2.8.13 ***** THIS IS NOT REAL REDIS BUT A VERY BASIC JAVA PORT *****\r\n");
+            sb.append("redis_version:");
+            sb.append(null==version ? "2.0.0" : version);
+            sb.append(" ***** THIS IS NOT REAL REDIS BUT REDISJ - A VERY BASIC JAVA PORT *****\r\n");
             sb.append(String.format("tcp_port:%d\r\n", port));
-            sb.append(String.format("uptime_in_seconds:%d\r\n", uptime_in_seconds));
+            sb.append(String.format("uptime_in_seconds:%d\r\n", uptimeSeconds));
             sb.append(CRLF_STRING);
 
             sb.append("# Stats\r\n");
@@ -1373,7 +1535,7 @@ public class RedisServer {
             sb.append("# Keyspace\r\n");
             Set<Integer> keys = null;
             synchronized (databases) {
-                keys = databases.keySet();
+                keys = new LinkedHashSet<Integer>(databases.keySet());
             }
 
             for (Integer num : keys) {
@@ -1387,15 +1549,729 @@ public class RedisServer {
             writer.sendReply(sb);
         }
 
-        protected void _set(List<String> args, boolean nx) throws IOException {
+        @CommandMethod(args = {"key", "cursor", "[MATCH pattern]"}, min=2, since="2.8.0")
+        protected void hscan(Database db, Args args) throws IOException {
+            _todo("hscan");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0", ro=true)
+        protected void monitor(Database db, Args args) throws IOException {
+            _todo("monitor");
+        }
+
+        @CommandMethod(args = {"[NOSAVE|SAVE]"}, min=0, max=1, since="1.0.0")
+        protected void shutdown(Database db, Args args) throws IOException {
+
+            logInfo("User requested shutdown...");
+            stopRequested = true;
+            portListener.executor.shutdownNow();
+            portListener.interrupt();
+
+            for (Worker w : workers) {
+                w.kill();
+            }
+            if (null!=persistifier) {
+                try {
+                    logInfo("Saving the final RDB snapshot before exiting.");
+                    persistifier.persist(databases);
+                }
+                catch (Exception e) {
+                    logError("Exception: %s", e);
+                }
+            }
+            onServerStopped("USERREQUEST");
+            stop();
+        }
+
+        @CommandMethod(args = {}, since="1.0.0", ro=true)
+        protected void lastsave(Database db, Args args) throws IOException {
+            _todo("lastsave");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void sync(Database db, Args args) throws IOException {
+            _todo("sync");
+        }
+
+        @CommandMethod(args = {}, since="2.6.0", ro=true)
+        protected void time(Database db, Args args) throws IOException {
+            long millis = now();
+            ArrayList<String> list = new ArrayList<String>();
+            list.add(Long.toString(millis/1000));
+            list.add(Long.toString(millis%1000) + "000");
+            writer.sendArray(list);
+        }
+
+        @CommandMethod(args= {"key", "bit", "value"}, since="2.2.0")
+        protected void setbit(Database db, Args args) throws IOException {
+            _todo("setbit");
+        }
+
+        @CommandMethod(args = {"key", "value"}, since="2.2.0")
+        protected void rpushx(Database db, Args args) throws IOException {
+            _todo("rpushx");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0", ro=true)
+        protected void auth(Database db, Args args) throws IOException {
+            _todo("auth");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void bgrewriteaof(Database db, Args args) throws IOException {
+            _todo("bgrewriteaof");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void bgsave(Database db, Args args) throws IOException {
+            _todo("bgsave");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void bitfield(Database db, Args args) throws IOException {
+            _todo("bitfield");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void bitop(Database db, Args args) throws IOException {
+            _todo("bitop");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void bitpos(Database db, Args args) throws IOException {
+            _todo("bitpos");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void brpoplpush(Database db, Args args) throws IOException {
+            _todo("brpoplpush");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void bzpopmin(Database db, Args args) throws IOException {
+            _todo("bzpopmin");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void bzpopmax(Database db, Args args) throws IOException {
+            _todo("bzpopmax");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void cluster(Database db, Args args) throws IOException {
+            _todo("cluster");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void command(Database db, Args args) throws IOException {
+            _todo("command");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void config(Database db, Args args) throws IOException {
+            _todo("config");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0", ro=true)
+        protected void debug(Database db, Args args) throws IOException {
+            _todo("debug");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void discard(Database db, Args args) throws IOException {
+            _todo("discard");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0", ro=true)
+        protected void dump(Database db, Args args) throws IOException {
+            _todo("dump");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void eval(Database db, Args args) throws IOException {
+            _todo("eval");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void evalsha(Database db, Args args) throws IOException {
+            _todo("evalsha");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void exec(Database db, Args args) throws IOException {
+            _todo("exec");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void expireat(Database db, Args args) throws IOException {
+            _todo("expireat");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void geoadd(Database db, Args args) throws IOException {
+            _todo("geoadd");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void geohash(Database db, Args args) throws IOException {
+            _todo("geohash");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void geopos(Database db, Args args) throws IOException {
+            _todo("geopos");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void geodist(Database db, Args args) throws IOException {
+            _todo("geodist");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void georadius(Database db, Args args) throws IOException {
+            _todo("georadius");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void georadiusbymember(Database db, Args args) throws IOException {
+            _todo("georadiusbymember");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0", ro=true)
+        protected void getrange(Database db, Args args) throws IOException {
+            _todo("getrange");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void getset(Database db, Args args) throws IOException {
+            _todo("getset");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0", ro=true)
+        protected void lolwut(Database db, Args args) throws IOException {
+            _todo("lolwut");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0", ro=true)
+        protected void lindex(Database db, Args args) throws IOException {
+            _todo("lindex");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void linsert(Database db, Args args) throws IOException {
+            _todo("linsert");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void lpushx(Database db, Args args) throws IOException {
+            _todo("lpushx");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0", ro=true)
+        protected void lrange(Database db, Args args) throws IOException {
+            _todo("lrange");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void lrem(Database db, Args args) throws IOException {
+            _todo("lrem");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void lset(Database db, Args args) throws IOException {
+            _todo("lset");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void ltrim(Database db, Args args) throws IOException {
+            _todo("ltrim");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void memory(Database db, Args args) throws IOException {
+            _todo("memory");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void migrate(Database db, Args args) throws IOException {
+            _todo("migrate");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void module(Database db, Args args) throws IOException {
+            _todo("module");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void move(Database db, Args args) throws IOException {
+            _todo("move");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void multi(Database db, Args args) throws IOException {
+            _todo("multi");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void object(Database db, Args args) throws IOException {
+            _todo("object");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void persist(Database db, Args args) throws IOException {
+            _todo("persist");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void pexpire(Database db, Args args) throws IOException {
+            _todo("pexpire");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void pexpireat(Database db, Args args) throws IOException {
+            _todo("pexpireat");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void pfadd(Database db, Args args) throws IOException {
+            _todo("pfadd");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void pfcount(Database db, Args args) throws IOException {
+            _todo("pfcount");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void pfmerge(Database db, Args args) throws IOException {
+            _todo("pfmerge");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void psubscribe(Database db, Args args) throws IOException {
+            _todo("psubscribe");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void pubsub(Database db, Args args) throws IOException {
+            _todo("pubsub");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void publish(Database db, Args args) throws IOException {
+            _todo("publish");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void punsubscribe(Database db, Args args) throws IOException {
+            _todo("punsubscribe");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void quit(Database db, Args args) throws IOException {
+            _todo("quit");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void randomkey(Database db, Args args) throws IOException {
+            _todo("randomkey");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void readonly(Database db, Args args) throws IOException {
+            _todo("readonly");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void readwrite(Database db, Args args) throws IOException {
+            _todo("readwrite");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void rename(Database db, Args args) throws IOException {
+            _todo("rename");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void renamenx(Database db, Args args) throws IOException {
+            _todo("renamenx");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void restore(Database db, Args args) throws IOException {
+            _todo("restore");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0", ro=true)
+        protected void role(Database db, Args args) throws IOException {
+            @SuppressWarnings("serial")
+            ArrayList<String> list = new ArrayList<String>() {
+                { add("master"); add("0"); add(null); }
+            };
+            writer.sendArray(list);
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void rpoplpush(Database db, Args args) throws IOException {
+            _todo("rpoplpush");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void sadd(Database db, Args args) throws IOException {
+            _todo("sadd");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void scard(Database db, Args args) throws IOException {
+            _todo("scard");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void script(Database db, Args args) throws IOException {
+            _todo("script");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void sdiff(Database db, Args args) throws IOException {
+            _todo("sdiff");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void sdiffstore(Database db, Args args) throws IOException {
+            _todo("sdiffstore");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void setrange(Database db, Args args) throws IOException {
+            _todo("setrange");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void sinter(Database db, Args args) throws IOException {
+            _todo("sinter");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void sinterstore(Database db, Args args) throws IOException {
+            _todo("sinterstore");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void sismember(Database db, Args args) throws IOException {
+            _todo("sismember");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void slaveof(Database db, Args args) throws IOException {
+            _todo("slaveof");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void replicaof(Database db, Args args) throws IOException {
+            _todo("replicaof");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void slowlog(Database db, Args args) throws IOException {
+            _todo("slowlog");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void smembers(Database db, Args args) throws IOException {
+            _todo("smembers");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void smove(Database db, Args args) throws IOException {
+            _todo("smove");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void sort(Database db, Args args) throws IOException {
+            _todo("sort");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void spop(Database db, Args args) throws IOException {
+            _todo("spop");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void srandmember(Database db, Args args) throws IOException {
+            _todo("srandmember");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void srem(Database db, Args args) throws IOException {
+            _todo("srem");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0", ro=true)
+        protected void strlen(Database db, Args args) throws IOException {
+            Ageable a = db.get(args.key(), false);
+            writer.sendNumber(null==a ? 0 : ((String)a.get()).length());
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void subscribe(Database db, Args args) throws IOException {
+            _todo("subscribe");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void sunion(Database db, Args args) throws IOException {
+            _todo("sunion");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void sunionstore(Database db, Args args) throws IOException {
+            _todo("sunionstore");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void swapdb(Database db, Args args) throws IOException {
+            _todo("swapdb");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void psync(Database db, Args args) throws IOException {
+            _todo("psync");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void touch(Database db, Args args) throws IOException {
+            _todo("touch");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void unsubscribe(Database db, Args args) throws IOException {
+            _todo("unsubscribe");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void unlink(Database db, Args args) throws IOException {
+            _todo("unlink");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void unwatch(Database db, Args args) throws IOException {
+            _todo("unwatch");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void wait(Database db, Args args) throws IOException {
+            _todo("wait");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void watch(Database db, Args args) throws IOException {
+            _todo("watch");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void zadd(Database db, Args args) throws IOException {
+            _todo("zadd");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void zcard(Database db, Args args) throws IOException {
+            _todo("zcard");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void zcount(Database db, Args args) throws IOException {
+            _todo("zcount");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void zincrby(Database db, Args args) throws IOException {
+            _todo("zincrby");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void zinterstore(Database db, Args args) throws IOException {
+            _todo("zinterstore");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void zlexcount(Database db, Args args) throws IOException {
+            _todo("zlexcount");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void zpopmax(Database db, Args args) throws IOException {
+            _todo("zpopmax");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void zpopmin(Database db, Args args) throws IOException {
+            _todo("zpopmin");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void zrange(Database db, Args args) throws IOException {
+            _todo("zrange");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void zrangebylex(Database db, Args args) throws IOException {
+            _todo("zrangebylex");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void zrevrangebylex(Database db, Args args) throws IOException {
+            _todo("zrevrangebylex");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void zrangebyscore(Database db, Args args) throws IOException {
+            _todo("zrangebyscore");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void zrank(Database db, Args args) throws IOException {
+            _todo("zrank");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void zrem(Database db, Args args) throws IOException {
+            _todo("zrem");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void zremrangebylex(Database db, Args args) throws IOException {
+            _todo("zremrangebylex");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void zremrangebyrank(Database db, Args args) throws IOException {
+            _todo("zremrangebyrank");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void zremrangebyscore(Database db, Args args) throws IOException {
+            _todo("zremrangebyscore");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void zrevrange(Database db, Args args) throws IOException {
+            _todo("zrevrange");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void zrevrangebyscore(Database db, Args args) throws IOException {
+            _todo("zrevrangebyscore");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void zrevrank(Database db, Args args) throws IOException {
+            _todo("zrevrank");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void zscore(Database db, Args args) throws IOException {
+            _todo("zscore");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void zunionstore(Database db, Args args) throws IOException {
+            _todo("zunionstore");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void scan(Database db, Args args) throws IOException {
+            _todo("scan");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void sscan(Database db, Args args) throws IOException {
+            _todo("sscan");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void zscan(Database db, Args args) throws IOException {
+            _todo("zscan");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void xinfo(Database db, Args args) throws IOException {
+            _todo("xinfo");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void xadd(Database db, Args args) throws IOException {
+            _todo("xadd");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void xtrim(Database db, Args args) throws IOException {
+            _todo("xtrim");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void xdel(Database db, Args args) throws IOException {
+            _todo("xdel");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void xrange(Database db, Args args) throws IOException {
+            _todo("xrange");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void xrevrange(Database db, Args args) throws IOException {
+            _todo("xrevrange");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void xlen(Database db, Args args) throws IOException {
+            _todo("xlen");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void xread(Database db, Args args) throws IOException {
+            _todo("xread");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void xgroup(Database db, Args args) throws IOException {
+            _todo("xgroup");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void xreadgroup(Database db, Args args) throws IOException {
+            _todo("xreadgroup");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void xack(Database db, Args args) throws IOException {
+            _todo("xack");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void xclaim(Database db, Args args) throws IOException {
+            _todo("xclaim");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void xpending(Database db, Args args) throws IOException {
+            _todo("xpending");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0")
+        protected void latency(Database db, Args args) throws IOException {
+            _todo("latency");
+        }
+
+        protected void _todo(String cmd) throws IOException {
+            writer.sendError("TODO", "Command '%s' not yet implemented", cmd);
+        }
+
+        protected void _set(Database db, List<String> args, boolean nx) throws IOException {
 
             assertArgCount(args, 2);
             String key  = args.get(0);
             String value = args.get(1);
 
-            logInfo("SET: " + key + " (" + value.length() + " chars)");
-
-            Database db = getSelectedDb().markDirty();
             if (nx) {
                 if (db.containsKey(key)) {
                     writer.sendError("ERR", "Key exists");
@@ -1404,13 +2280,13 @@ public class RedisServer {
             }
 
             db.put(key, new Ageable(value));
+            db.markDirty();
             writer.write(OK_BYTES);
         }
 
-        protected void _mset(List<String> args, boolean nx) throws IOException {
+        protected void _mset(Database db, List<String> args, boolean nx) throws IOException {
 
-            Database db = getSelectedDb().markDirty();
-
+            db.markDirty();
             if (nx) {
                 for (int i=1; i<args.size(); i+=2) {
 
@@ -1450,9 +2326,9 @@ public class RedisServer {
             }
         }
 
-        protected void _incrDecr(String key, boolean incr, String amount, boolean _float) throws IOException {
+        protected void _incrDecr(Database db, String key, boolean incr, String amount, boolean _float) throws IOException {
 
-            Database db = getSelectedDb().markDirty();
+            db.markDirty();
             Ageable a = db.get(key, false);
             if (null==a) {
                 db.put(key, a = new Ageable("0"));
@@ -1475,17 +2351,47 @@ public class RedisServer {
             }
         }
 
-        protected void _todo(String cmd) throws IOException {
-            _todo(cmd);
+        protected void _hincrBy(Database db, Args args, boolean _float) throws IOException {
+
+            String key   = args.get(0);
+            String field = args.get(1);
+
+            synchronized (db) {
+                Ageable a = db.get(key, false);
+                Hash hash = null;
+                if (null==a) {
+                    db.put(key, new Ageable(hash = new Hash()));
+                }
+                else {
+                    hash = (Hash) a.value;
+                }
+
+                if (_float) {
+                    double incr = Double.parseDouble(args.get(2));
+                    String value = hash.getOrDefault(field, "0");
+                    double sum = Double.parseDouble(value)+incr;
+                    String string = Double.toString(sum);
+                    hash.put(field, string);
+                    writer.sendString(string);
+                }
+                else {
+                    long incr = Long.parseLong(args.get(2));
+                    String value = hash.getOrDefault(field, "0");
+                    long sum = Long.parseLong(value)+incr;
+                    String string = Long.toString(sum);
+                    hash.put(field, string);
+                    writer.sendNumber(sum);
+                }
+            }
         }
 
-        protected void _bpop(boolean left, List<String> args) throws IOException {
+        protected void _bpop(Database db, boolean left, List<String> args) throws IOException {
 
             String last = args.get(args.size()-1);
             Long timeout = toLong(last);
             long expires = (timeout>0) ? now()+1000*timeout : -1;
 
-            Database db = getSelectedDb().markDirty();
+            db.markDirty();
             Object item = null;
             boolean expired = false;
             for (;!portListener.stopRequested && !expired;) {
@@ -1531,8 +2437,8 @@ public class RedisServer {
             writer.write(EMPTY_BYTES);
         }
 
-        protected void _pop(String key, boolean left) throws IOException {
-            Database db = getSelectedDb().markDirty();
+        protected void _pop(Database db, String key, boolean left) throws IOException {
+            db.markDirty();
             Object item = null;
             Ageable a = db.get(key, false);
             if (null!=a) {
@@ -1556,36 +2462,32 @@ public class RedisServer {
             }
         }
 
-        protected void _push(String key, String val, boolean left) throws IOException {
-            Database db = getSelectedDb().markDirty();
+        protected void _push(Database db, String key, String val, boolean left) throws IOException {
             Ageable a = db.get(key, false);
             if (null==a) {
                 db.put(key, a = new Ageable(new ArrayList<Object>()));
+                db.markDirty();
             }
 
-            Object obj = a.value;
-            if (!(obj instanceof List)) {
-                writer.sendError("WRONGTYPE", "Operation against a key holding the wrong kind of value");
+            @SuppressWarnings("unchecked")
+            List<Object> list = (List<Object>) a.value;
+            db.markDirty();
+            if (left) {
+                list.add(0, val);
             }
             else {
-                @SuppressWarnings("unchecked")
-                List<Object> list = (List<Object>) obj;
-                if (left) {
-                    list.add(0, val);
-                }
-                else {
-                    list.add(val); /// at end
-                }
-                writer.sendNumber(list.size());
+                list.add(val); /// at end
             }
+            writer.sendNumber(list.size());
         }
 
-        protected void _hset(String key, String field, String value, boolean nx) throws IOException {
-            Database db = getSelectedDb();
+        protected void _hset(Database db, String key, String field, String value, boolean nx) throws IOException {
+
             synchronized (db) {
                 Ageable a = db.get(key, false);
                 Hash hash = null;
                 if (null==a) {
+                    db.markDirty();
                     db.put(key, new Ageable(hash = new Hash()));
                 }
                 else {
@@ -1596,11 +2498,34 @@ public class RedisServer {
                     writer.sendNumber(0);
                 }
                 else {
+                    db.markDirty();
                     hash.put(field, value);
                     writer.sendNumber(1);
                 }
             }
 
+        }
+
+        protected void kill() {
+            try {
+                socket.close();
+                socket = null;
+            }
+            catch (Exception e) {
+                logError("%s[%d]: kill: %s, ", getClass().getSimpleName(), port, e);
+            }
+        }
+
+        protected boolean hasAddr(String ipPort) {
+            String actual = socket.getRemoteSocketAddress().toString();
+            if (actual.startsWith("/")) {
+                actual = actual.substring(1);
+            }
+            return ipPort.equals(actual);
+        }
+
+        protected long clientId() {
+            return Thread.currentThread().getId();
         }
 
         protected void assertArgCount(List<String> args, int expected) throws WrongNumberOfArgsException {
@@ -1639,12 +2564,17 @@ public class RedisServer {
             return null==s ? null : Double.parseDouble(s);
         }
 
-        protected String clientId;
         protected String clientName;
         protected int selectedDb;
         protected RESPReader reader;
+        protected long started;
+
         protected RESPWriter writer;
         protected Socket socket;
+        final int NIBBLE_BITS[] = {
+                0, 1, 1, 2, 1, 2, 2, 3,
+                1, 2, 2, 3, 2, 3, 3, 4
+        };
     }
 
     /**
@@ -1699,7 +2629,7 @@ public class RedisServer {
             String line = br.readLine();
             if (null==line) {
                 SocketAddress addr = null==socket ? null :  socket.getRemoteSocketAddress();
-                logError("RESPReader: connection closed %s", addr);
+                logInfo("RESPReader[%d]: client disconnected %s", port, addr);
                 return null; // EOF
             }
 
@@ -1846,7 +2776,7 @@ public class RedisServer {
         public void sendError(String category, String format, Object ... args) throws IOException {
 
             String formatted = String.format(format, args);
-            logError(CN + ".RESPWriter: " + formatted);
+            logError(CN + ".RESPWriter.sendError: " + formatted);
             String line = "-" + category + " " + formatted + "\r\n";
             output.write(line.getBytes(StandardCharsets.UTF_8));
             output.flush();
@@ -1890,10 +2820,12 @@ public class RedisServer {
     class Persistifier extends Thread {
 
         public Persistifier(RedisServer redisServer) {
-            this(redisServer, createTempDir());
+            this(redisServer, createWorkDir());
         }
 
         public Persistifier(RedisServer redisServer, String dirname) {
+            super(Persistifier.class.getSimpleName());
+            super.setDaemon(true);
             this.redisServer = redisServer;
             this.dir = new File(dirname);
             this.dir.mkdirs();
@@ -2255,20 +3187,59 @@ public class RedisServer {
     @SuppressWarnings("serial")
     class Args extends ArrayList<String> {
 
+        public String key() {
+            return get(0);
+        }
+
     }
 
     /**
      * We need this annotation at runtime to find methods matching redis command:
      */
     @Retention( RetentionPolicy.RUNTIME )
-    public @interface RedisCommand {
+    public @interface CommandMethod {
+
+        /**
+         * List of arguments required for this command, mainly for testing number of arguments
+         * but also for generating usage information.
+         * @return
+         */
         String[] args();
 
+        /**
+         * true if command required an even number of arguments
+         * @return
+         */
         boolean even() default false;
+
+        /**
+         * true if command required an odd number of arguments
+         * @return
+         */
         boolean odd() default false;
 
+        /**
+         * true if the command requires an instance of the currently selected database
+         * @return
+         */
+        boolean db() default true;
+
+        /**
+         * Minimum number of arguments needed if >-1
+         * @return
+         */
         int min() default -1;
+
+        /**
+         * Maximum number of arguments needed if >-1
+         * @return
+         */
         int max() default -1;
+
+        String since();
+
+        // TODO: Use info whether a methoid is R/O only.
+        boolean ro() default false;
     }
 
     static final String CN = RedisServer.class.getSimpleName();
@@ -2288,7 +3259,9 @@ public class RedisServer {
 
     protected String persistDir;
 
-    protected long connectedClients;
+    protected LinkedHashSet<Worker> workers = new LinkedHashSet<Worker>();
+
+    protected volatile boolean acceptingConnections = false;
     protected long totalConnectionsReceived;
     protected long totalCommandsProcessed;
     protected long clientLongestOutputList;
@@ -2301,8 +3274,7 @@ public class RedisServer {
     protected Persistifier persistifier;
     protected PortListener portListener;
     protected StartupThread startupThread;
-
     protected int threadPoolSize = DEFAULT_THREAD_POOL_SIZE;
-
     protected volatile boolean stopRequested;
+    protected String version;
 }

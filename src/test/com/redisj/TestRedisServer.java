@@ -1,6 +1,7 @@
 package com.redisj;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
@@ -44,7 +45,7 @@ public class TestRedisServer {
     @Before
     public void setUp() {
         if (null!=server) {
-            server.flush();
+            server.flushAll();
         }
     }
 
@@ -413,12 +414,14 @@ public class TestRedisServer {
             System.err.println("WARNING: Redis server does not support HSTRLEN");
         }
 
-        List<String> vals = client.hvals(key);
-        assertEquals(4, vals.size());
-        assertTrue(vals.contains("1.5"));
-        assertTrue(vals.contains("3"));
-        assertTrue(vals.contains("Y"));
-        assertTrue(vals.contains("X"));
+        {
+            List<String> vals = client.hvals(key);
+            assertEquals(4, vals.size());
+            assertTrue(vals.contains("1.5"));
+            assertTrue(vals.contains("3"));
+            assertTrue(vals.contains("Y"));
+            assertTrue(vals.contains("X"));
+        }
 
         try {
             rc = client.get(key);
@@ -429,6 +432,64 @@ public class TestRedisServer {
             assertEquals("WRONGTYPE Operation against a key holding the wrong kind of value", actual);
         }
 
+        long count = client.hdel(key, "c", "d");
+        assertEquals(2, count);
+        {
+            List<String> vals = client.hvals(key);
+            assertEquals(2, vals.size());
+            assertTrue(vals.contains("1.5"));
+            assertTrue(vals.contains("3"));
+            assertFalse(vals.contains("Y"));
+            assertFalse(vals.contains("X"));
+        }
+    }
+
+    @Test
+    public void testBitcount() {
+        final String key = "key";
+        client.del(key);
+    
+        long n = client.bitcount(key);
+        assertEquals(0, n);
+    
+        String rc = client.set(key, "value");
+        assertEquals("OK", rc);
+    
+        long m = client.bitcount(key);
+        assertEquals(21, m);
+    }
+
+    @Test
+    public void testGetbit() {
+            final String key = "key";
+            client.del(key);
+    
+            String rc = client.set(key, "value");
+            assertEquals("OK", rc);
+    
+            assertTrue(!client.getbit(key,  0));
+            assertTrue( client.getbit(key,  1));
+            assertTrue( client.getbit(key,  2));
+            assertTrue( client.getbit(key,  3));
+            assertTrue(!client.getbit(key,  4));
+            assertTrue( client.getbit(key,  5));
+            assertTrue( client.getbit(key,  6));
+            assertTrue(!client.getbit(key,  7));
+    
+            assertTrue(!client.getbit(key,  8));
+            assertTrue( client.getbit(key,  9));
+            assertTrue( client.getbit(key,  10));
+            assertTrue(!client.getbit(key,  11));
+            assertTrue(!client.getbit(key,  12));
+            assertTrue(!client.getbit(key,  13));
+            assertTrue(!client.getbit(key,  14));
+            assertTrue( client.getbit(key,  15));
+    
+            assertTrue( client.getbit(key,  39));
+            assertTrue(!client.getbit(key,  40));
+            assertTrue(!client.getbit(key,  41));
+    
+            assertTrue(!client.getbit(key,  99));
     }
 
     protected static RedisServer server;
