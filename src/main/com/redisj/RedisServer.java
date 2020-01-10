@@ -32,8 +32,6 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.regex.Pattern;
 
-import com.redisj.RedisServer.Worker;
-
 /**
  *
  * @author apdlv72
