@@ -1,6 +1,7 @@
 package com.redisj;
 
 import java.io.BufferedReader;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
@@ -160,9 +161,16 @@ public class RedisServer {
         }
     }
 
-    public void save() throws IOException {
+    public void persist() throws IOException {
         if (null!=persistifier) {
             persistifier.persist(databases);
+        }
+    }
+
+    public void persist(int dbNum) throws IOException {
+        if (null!=persistifier) {
+            Database db = databases.get(dbNum);
+            persistifier.persist(db);
         }
     }
 
@@ -223,6 +231,18 @@ public class RedisServer {
 
     public void set(int db, String key, String value) {
         getDb(db).put(key, new Ageable(value));
+    }
+
+    public String hset(int dbNum, String key, String field, String value) throws IOException {
+
+        Worker worker = new Worker();
+        Database db = worker._select(dbNum);
+
+        Args args = new Args(key, field, value);
+        worker.hset(db, args);
+        String resp = worker.stream.toString();
+
+        return resp;
     }
 
     public <T> T get(int db, String key) {
@@ -705,10 +725,18 @@ public class RedisServer {
     class Worker implements Runnable {
 
         private String lastCommand;
+        private OutputStream stream;
+
         public Worker(Socket clientSocket) {
             //super.setDaemon(true);
             this.socket = clientSocket;
             this.started = now();
+        }
+
+        private Worker() {
+            this.socket = null;
+            this.stream = new ByteArrayOutputStream();
+            this.writer = new RESPWriter(this.stream);
         }
 
         @Override
@@ -865,14 +893,21 @@ public class RedisServer {
 
         @CommandMethod(args = {"db"}, since="1.0.0", db=false)
         protected void select(Database db, Args args) throws IOException {
+
             String num = args.get(0);
-            selectedDb = Integer.parseInt(num);
+            _select(Integer.parseInt(num));
+
             if (maxDb>-1 && selectedDb>=maxDb) {
                 writer.sendError("ERR", "Invalid database");
             }
             else {
                 writer.write("+OK\r\n".getBytes());
             }
+        }
+
+        protected Database _select(int n) {
+            selectedDb = n;
+            return getSelectedDb();
         }
 
         @CommandMethod(args = {}, since="1.0.0", ro=true)
@@ -2603,6 +2638,9 @@ public class RedisServer {
             else if (line.startsWith("*")) {
                 return readList(count);
             }
+            else if (line.startsWith("#")) {
+                return readHash(count);
+            }
             throw new RESPException("Expected $ or * but got " + truncateString(line));
         }
 
@@ -2658,6 +2696,16 @@ public class RedisServer {
             return list;
         }
 
+        protected Hash readHash(int count) throws IOException {
+            Hash hash = new Hash(count);
+            for (int i=0; i<count; i+=2) {
+                String key  = readString();
+                String value = readString();
+                hash.put(key, value);
+            }
+            return hash;
+        }
+
         protected String readString(int length) throws IOException {
             char[] cbuf = new char[length];
             readComplete(cbuf);
@@ -2707,6 +2755,7 @@ public class RedisServer {
             this.socket = socket;
         }
 
+
         public RESPWriter(OutputStream output) {
             this.output = output;
         }
@@ -2738,6 +2787,14 @@ public class RedisServer {
             }
         }
 
+        public void sendHash(Hash hash) throws IOException {
+            sendHashLength(hash.size());
+            for (Entry<String, String> e : hash.entrySet()) {
+                sendString(e.getKey());
+                sendString(e.getValue());
+            }
+        }
+
         public void sendArray(List<String> strings) throws IOException {
             sendArrayLength(strings.size());
             for (String s : strings) {
@@ -2752,6 +2809,11 @@ public class RedisServer {
 
         public void sendArrayLength(int len) throws IOException {
             output.write(("*" + len).getBytes());
+            output.write(CRLF_BYTES);
+        }
+
+        public void sendHashLength(int len) throws IOException {
+            output.write(("#" + len).getBytes());
             output.write(CRLF_BYTES);
         }
 
@@ -2953,6 +3015,12 @@ public class RedisServer {
                         writer.sendNumber(a.expires);
                         writer.sendArray(list);
                     }
+                    else if (obj instanceof Hash) {
+                        Hash hash = (Hash) obj;
+                        writer.sendString(key);
+                        writer.sendNumber(a.expires);
+                        writer.sendHash(hash);
+                    }
                     else {
                         throw new RuntimeException("Unsupported type " + obj.getClass());
                     }
@@ -3124,6 +3192,10 @@ public class RedisServer {
             super();
         }
 
+        public Hash(int count) {
+            super(count);
+        }
+
         public boolean contains(String field) {
             return super.containsKey(field);
         }
@@ -3184,6 +3256,14 @@ public class RedisServer {
 
     @SuppressWarnings("serial")
     class Args extends ArrayList<String> {
+
+        public Args(String ... strings) {
+            if (null!=strings) {
+                for (String s : strings) {
+                    add(s);
+                }
+            }
+        }
 
         public String key() {
             return get(0);
