@@ -62,7 +62,7 @@ public class TestPersistence {
     public void testHash() throws IOException {
         server.flushDb(0);
         String resp = server.hset(0, "key", "field", "value");
-        assertEquals(":1\n", resp);
+        assertEquals(":1\r\n", resp);
         server.persist(0);
     }
 
