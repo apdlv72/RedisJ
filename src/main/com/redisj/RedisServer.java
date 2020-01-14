@@ -1,7 +1,6 @@
 package com.redisj;
 
 import java.io.BufferedReader;
-import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
@@ -20,6 +19,8 @@ import java.net.SocketAddress;
 import java.net.SocketException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -227,34 +228,6 @@ public class RedisServer {
             }
             return db;
         }
-    }
-
-    public void set(int db, String key, String value) {
-        getDb(db).put(key, new Ageable(value));
-    }
-
-    public String hset(int dbNum, String key, String field, String value) throws IOException {
-
-        Worker worker = new Worker();
-        Database db = worker._select(dbNum);
-
-        Args args = new Args(key, field, value);
-        worker.hset(db, args);
-        String resp = worker.stream.toString();
-
-        return resp;
-    }
-
-    public <T> T get(int db, String key) {
-        Database d = getDb(db);
-        Ageable  a = d.get(key);
-        @SuppressWarnings("unchecked")
-        T t = notExpired(a) ? (T)a.value : null;
-        return t;
-    }
-
-    public void flushDb(int db) {
-        getDb(db).clear();
     }
 
     public int getPort() {
@@ -525,6 +498,22 @@ public class RedisServer {
         return found;
     }
 
+    protected Long toLong(String s) {
+        return null==s ? null : Long.parseLong(s);
+    }
+
+    protected Integer toInt(String s) {
+        return null==s ? null : Integer.parseInt(s);
+    }
+
+    protected Double toDouble(String s) {
+        return null==s ? null : Double.parseDouble(s);
+    }
+
+    public Database select(int dbNum) {
+        return getDb(dbNum);
+    }
+
     class StartupThread extends Thread {
 
         public StartupThread() {
@@ -724,19 +713,9 @@ public class RedisServer {
      */
     class Worker implements Runnable {
 
-        private String lastCommand;
-        private OutputStream stream;
-
         public Worker(Socket clientSocket) {
-            //super.setDaemon(true);
             this.socket = clientSocket;
             this.started = now();
-        }
-
-        private Worker() {
-            this.socket = null;
-            this.stream = new ByteArrayOutputStream();
-            this.writer = new RESPWriter(this.stream);
         }
 
         @Override
@@ -893,26 +872,19 @@ public class RedisServer {
 
         @CommandMethod(args = {"db"}, since="1.0.0", db=false)
         protected void select(Database db, Args args) throws IOException {
-
-            String num = args.get(0);
-            _select(Integer.parseInt(num));
-
-            if (maxDb>-1 && selectedDb>=maxDb) {
-                writer.sendError("ERR", "Invalid database");
+            int newDb = toInt(args.key());
+            if (maxDb>-1 && newDb>=maxDb) {
+                writer.sendError("ERR", "Invalid database " + newDb);
             }
             else {
+                selectedDb = newDb;
                 writer.write("+OK\r\n".getBytes());
             }
         }
 
-        protected Database _select(int n) {
-            selectedDb = n;
-            return getSelectedDb();
-        }
-
         @CommandMethod(args = {}, since="1.0.0", ro=true)
         protected void dbsize(Database db, Args args) throws IOException {
-            writer.sendNumber(db.size());
+            writer.sendNumber(db.dbsize());
         }
 
         @CommandMethod(args = {"[ASYNC]"}, min=0, max=1, since="1.0.0", db=false)
@@ -924,220 +896,159 @@ public class RedisServer {
 
         @CommandMethod(args = {"pattern"}, since="1.0.0", ro=true)
         protected void keys(Database db, Args args) throws IOException {
-
-            String glob = args.get(0);
-
-            Pattern rex = createRegexFromGlob(glob);
-            ArrayList<String> matches = new ArrayList<String>();
-
-            for (String key : db.keySet()) {
-                if (rex.matcher(key).matches()) {
-                    matches.add(key);
-                }
-            }
-
+            String pattern = args.key();
+            Collection<String> matches = db.keys(pattern);
             writer.sendArray(matches);
         }
 
         @CommandMethod(args= {"key"}, since="1.0.0", ro=true)
         protected void get(Database db, Args args) throws IOException {
-            String key = args.get(0);
-            Ageable a = db.get(key, false);
-            if (null==a) {
+            String string = db.get(args.key());
+            if (null==string) {
                 writer.write(EMPTY_BYTES);
             }
             else {
-                String string = a.get();
                 writer.sendString(string);
             }
         }
 
         @CommandMethod(args= {"key"}, since="1.0.0", ro=true)
         protected void exists(Database db, Args args) throws IOException {
-            String key = args.get(0);
-            Ageable a = db.get(key, false);
-            writer.sendNumber(null==a ? 0 : 1);
+            boolean exists = db.exists(args.key());
+            writer.sendNumber(exists ? 1 : 0);
         }
 
         @CommandMethod(args= {"key"}, since="2.6.0")
         protected void bitcount(Database db, Args args) throws IOException {
-
-            String key = args.get(0);
-            int count = 0;
-            Ageable a = db.get(key, false);
-            if (null!=a) {
-                String s = a.get();
-                for (int i=0, len=s.length(); i<len; i++) {
-                    char c = s.charAt(i);
-                    int upper = ((byte)c) >> 4;
-                    int lower = ((byte)c) & 0x0f;
-                    count += NIBBLE_BITS[upper] + NIBBLE_BITS[lower];
-                }
-            }
+            int count = db.bitcount(args.key());
             writer.sendNumber(count);
         }
 
         @CommandMethod(args= {"key", "offset"}, since="2.2.0", ro=true)
         protected void getbit(Database db, Args args) throws IOException {
-
-            String key = args.get(0);
-            int value = 0;
-            Ageable a = db.get(key, false);
-            if (null!=a) {
-                String s = a.get();
-                int off = Integer.parseInt(args.get(1));
-                int pos = off/8;
-                char c = (null==s || pos>=s.length()) ? 0 : s.charAt(pos);
-                byte mask = (byte)(0x80 >> (off%8));
-                if ((mask & c) > 0) {
-                    value = 1;
-                }
-            }
+            int off = Integer.parseInt(args.get(1));
+            int value = db.getbit(args.key(), off);
             writer.sendNumber(value);
         }
 
         @CommandMethod(args = {"key", "value"}, since="1.0.0")
         protected void set(Database db, Args args) throws IOException {
-            _set(db, args, false);
+            db.set(args.key(), args.get(1));
+            writer.write(OK_BYTES);
         }
 
         @CommandMethod(args = {"key", "value"}, since="1.0.0")
         protected void setnx(Database db, Args args) throws IOException {
-            _set(db, args, true);
+            boolean ok = db.setnx(args.key(), args.get(1));
+            if (ok) {
+                writer.write(OK_BYTES);
+            }
+            else {
+                writer.sendError("ERR", "Key exists");
+            }
         }
 
         @CommandMethod(args = {"key", "value"}, since="2.0.0")
         protected void append(Database db, Args args) throws IOException {
-            String key = args.get(0);
+            String key   = args.key();
             String value = args.get(1);
-            Ageable a = db.get(key, false);
-            long len = 0;
-            if (null==a) {
-                db.put(key, new Ageable(value));
-                len = value.length();
-            }
-            else {
-                String s = a.value.toString() + value;
-                a.value = s;
-                len = s.length();
-            }
+            long len = db.append(key, value);
             writer.sendNumber(len);
         }
 
         @CommandMethod(args = {"key1", "key2", "..."}, min=1, since="1.0.0", ro=true)
         protected void mget(Database db, Args args) throws IOException {
-            writer.sendArrayLength(args.size());
-            for (String key : args) {
-                Ageable a = db.get(key, false);
-                if (null==a) {
-                    writer.write(EMPTY_BYTES);
-                }
-                else {
-                    String string = a.get();
-                    writer.sendString(string);
-                }
-            }
+            List<String> values = db.mget(args);
+            writer.sendArray(values);
         }
 
         @CommandMethod(args = {"key"}, since="1.0.0", ro=true)
         protected void llen(Database db, Args args) throws IOException {
-
-            String key = args.get(0);
-            Ageable a = db.get(key, false);
-            if (null==a) {
-                writer.sendNumber(0);
-            }
-            else {
-                List<Object> list = a.get();
-                writer.sendNumber(list.size());
-            }
+            int len = db.llen(args.key());
+            writer.sendNumber(len);
         }
 
         @CommandMethod(args = {"key"}, since="1.0.0")
         protected void lpop(Database db, Args args) throws IOException {
-            String key = args.get(0);
-            _pop(db, key, true);
+            String item = db.lpop(args.key());
+            if (null==item) {
+                writer.write(EMPTY_BYTES);
+            }
+            else {
+                writer.sendString(item);
+            }
         }
 
         @CommandMethod(args = {"key"}, since="1.0.0")
         protected void rpop(Database db, Args args) throws IOException {
-            String key = args.get(0);
-            _pop(db, key, false);
+            String item = db.rpop(args.key());
+            if (null==item) {
+                writer.write(EMPTY_BYTES);
+            }
+            else {
+                writer.sendString(item);
+            }
         }
 
         @CommandMethod(args = {"key", "value"}, since="1.0.0")
         protected void rpush(Database db, Args args) throws IOException {
-            String key   = args.get(0);
             String value = args.get(1);
-            _push(db, key, value, false);
+            List<Object> list = db.rpush(args.key(), value);
+            writer.sendNumber(list.size());
         }
 
         @CommandMethod(args = {"key", "value"}, since="1.0.0")
         protected void lpush(Database db, Args args) throws IOException {
-            String key   = args.get(0);
             String value = args.get(1);
-            _push(db, key, value, true);
+            List<Object> list = db.lpush(args.key(), value);
+            writer.sendNumber(list.size());
         }
 
         @CommandMethod(args = {"key"}, since="1.0.0", ro=true)
         protected void type(Database db, Args args) throws IOException {
-
-            String key = args.get(0);
-            Ageable a = db.get(key, false);
-            if (notExpired(a)) {
-                Object value = a.value;
-                if (value instanceof String) {
-                    writer.write("+string\r\n".getBytes());
-                }
-                else if (value instanceof List) {
-                    writer.write("+list\r\n".getBytes());
-                }
-                else if (value instanceof Set) {
-                    writer.write("+set\r\n".getBytes());
-                }
-                else if (value instanceof Map) {
-                    writer.write("+hash\r\n".getBytes());
-                }
-                else if (value instanceof ZSet) {
-                    writer.write("+zset\r\n".getBytes());
-                }
-                else {
-                    writer.write(NONE_BYTES);
-                }
+            String type = db.type(args.key());
+            if (null==type) {
+                writer.write(NONE_BYTES);
             }
             else {
-                writer.write(NONE_BYTES);
+                writer.write(("+" + type + "\r\n").getBytes());
             }
         }
 
         @CommandMethod(args = {"key", "amout"}, since="2.6.0")
         protected void incrbyfloat(Database db, Args args) throws IOException {
-            _incrDecr(db, args.get(0), true, args.get(1), true);
+            Double amount = toDouble(args.get(1));
+            double d = db.incrbyfloat(args.key(), amount);
+            writer.sendString(Double.toString(d));
         }
 
         @CommandMethod(args = {"key", "amout"}, since="1.0.0")
         protected void decrby(Database db, Args args) throws IOException {
-            _incrDecr(db, args.get(0), false, args.get(1), false);
+            long l = db._incrDecr(args.key(), false, args.get(1));
+            writer.sendNumber(l);
         }
 
         @CommandMethod(args = {"key", "amout"}, since="1.0.0")
         protected void incrby(Database db, Args args) throws IOException {
-            _incrDecr(db, args.get(0), true, args.get(1), false);
+            long l = db._incrDecr(args.key(), true, args.get(1));
+            writer.sendNumber(l);
         }
 
         @CommandMethod(args = {"key"}, since="1.0.0")
         protected void decr(Database db, Args args) throws IOException {
-            _incrDecr(db, args.get(0), false, "1", false);
+            long l = db._incrDecr(args.key(), false, "1");
+            writer.sendNumber(l);
         }
 
         @CommandMethod(args = {"key"}, since="1.0.0")
         protected void incr(Database db, Args args) throws IOException {
-            _incrDecr(db, args.get(0), true, "1", false);
+            long l = db._incrDecr(args.key(), true, "1");
+            writer.sendNumber(l);
         }
 
         @CommandMethod(args = {"subcmd", "[option]"}, min=1, max=2, since="2.4.0")
         protected void client(Database db, Args args) throws IOException {
-            String subcmd = args.get(0).toUpperCase();
+            String subcmd = args.key().toUpperCase();
             if ("ID".equals(subcmd)) {
                 // since="5.0.0"
                 writer.sendString(""+clientId());
@@ -1193,220 +1104,117 @@ public class RedisServer {
 
         @CommandMethod(args = {"message"}, since="1.0.0", ro=true)
         protected void echo(Database db, Args args) throws IOException {
-            String message = args.get(0);
+            String message = args.key();
             writer.sendString(message);
         }
 
         @CommandMethod(args = {"key", "field", "value"}, since="2.0.0")
         protected void hset(Database db, Args args) throws IOException {
-            String key = args.get(0);
+            String key = args.key();
             String field = args.get(1);
             String value = args.get(2);
-            _hset(db, key, field, value, false);
+            int rc = db.hset(key, field, value);
+            writer.sendNumber(rc);
         }
 
         @CommandMethod(args = {"key", "field", "value"}, since="2.0.0")
         protected void hsetnx(Database db, Args args) throws IOException {
-            String key = args.get(0);
+            String key = args.key();
             String field = args.get(1);
             String value = args.get(2);
-            _hset(db, key, field, value, true);
+            int rc = db.hsetnx(key, field, value);
+            writer.sendNumber(rc);
         }
 
         @CommandMethod(args = {"key", "field1", "field2", "field3", "..."}, min=2, since="2.0.0", ro=true)
         protected void hmget(Database db, Args args) throws IOException {
-            String key = args.get(0);
-            synchronized (db) {
-                Ageable a = db.get(key, false);
-                List<String> list = new ArrayList<String>();
-                if (null!=a) {
-                    Hash hash = (Hash) a.value;
-                    for (int i=1, len=args.size(); i<len; i++) {
-                        String value = hash.get(args.get(i));
-                        list.add(value);
-                    }
-                }
-                writer.sendArray(list);
-            }
+            String key = args.key();
+            List<String> list = db.hmget(key, args);
+            writer.sendArray(list);
         }
 
         @CommandMethod(args = {"key", "field1", "value1", "field2", "value2", "..."}, odd=true, min=3, since="2.0.0")
         protected void hmset(Database db, Args args) throws IOException {
-            String key = args.get(0);
-            synchronized (db) {
-                Ageable a = db.get(key, false);
-                Hash hash = null;
-                if (null==a) {
-                    db.put(key, new Ageable(hash = new Hash()));
-                }
-                else {
-                    hash = (Hash) a.value;
-                }
-
-                for (int i=1, len=args.size(); i<len; i+=2) {
-                    hash.put(args.get(i), args.get(i+1));
-                }
-
-                writer.sendString("OK");
-            }
+            String key = args.remove(0);
+            db.hmset(key, args);
+            writer.sendString("OK");
         }
 
         @CommandMethod(args = {"key"}, since="2.0.0", ro=true)
         protected void hkeys(Database db, Args args) throws IOException {
-            String key = args.get(0);
-            synchronized (db) {
-                Ageable a = db.get(key, false);
-                List<String> list = new ArrayList<String>();
-                if (null!=a) {
-                    Hash hash = (Hash) a.value;
-                    for (String field : hash.keySet()) {
-                        list.add(field);
-                    }
-                }
-                writer.sendArray(list);
-            }
+            List<String> list = db.hkeys(args.key());
+            writer.sendArray(list);
         }
 
         @CommandMethod(args = {"key"}, since="2.0.0", ro=true)
         protected void hvals(Database db, Args args) throws IOException {
-            String key = args.get(0);
-            synchronized (db) {
-                Ageable a = db.get(key, false);
-                List<String> list = new ArrayList<String>();
-                if (null!=a) {
-                    Hash hash = (Hash) a.value;
-                    for (String field : hash.values()) {
-                        list.add(field);
-                    }
-                }
-                writer.sendArray(list);
-            }
+            List<String> list = db.hvals(args.key());
+            writer.sendArray(list);
         }
 
         @CommandMethod(args = {"key", "field1", "field2", "..."}, min=2, since="2.0.0")
         protected void hdel(Database db, Args args) throws IOException {
-
-            Ageable a = db.get(args.key(), false);
-            if (null!=a) {
-                Hash hash = (Hash) a.value;
-                int count = 0;
-                for (int i=1; i<args.size(); i++) {
-                    String field = args.get(i);
-                    if (hash.contains(field)) {
-                        hash.remove(field);
-                        count++;
-                    }
-                }
-                writer.sendNumber(count);
-            }
+            String key = args.remove(0);
+            int count = db.hdel(key, args);
+            writer.sendNumber(count);
         }
 
         @CommandMethod(args = {"key"}, since="2.0.0", ro=true)
         protected void hlen(Database db, Args args) throws IOException {
-            String key = args.get(0);
-            synchronized (db) {
-                Ageable a = db.get(key, false);
-                if (null!=a) {
-                    Hash hash = (Hash) a.value;
-                    writer.sendNumber(hash.size());
-                }
-                else {
-                    writer.sendNumber(0);
-                }
-            }
+            String key = args.key();
+            int rc = db.hlen(key);
+            writer.sendNumber(rc);
         }
 
         @CommandMethod(args = {"key", "field"}, since="3.2.0", ro=true)
         protected void hstrlen(Database db, Args args) throws IOException {
-
-            String key   = args.get(0);
             String field = args.get(1);
-
-            synchronized (db) {
-                Ageable a = db.get(key, false);
-                if (null!=a) {
-                    Hash hash = (Hash) a.value;
-                    String value = hash.get(field);
-                    writer.sendNumber(value.length());
-                    return;
-                }
-                writer.sendNumber(-1);
-            }
+            int rc = db.hstrlen(args.key(), field);
+            writer.sendNumber(rc);
         }
 
         @CommandMethod(args = {"key", "field"}, since="2.0.0", ro=true)
         protected void hget(Database db, Args args) throws IOException {
-
-            String key   = args.get(0);
             String field = args.get(1);
-
-            synchronized (db) {
-                Ageable a = db.get(key, false);
-                if (null!=a) {
-                    Hash hash = (Hash) a.value;
-                    String value = hash.get(field);
-                    writer.sendString(value);
-                    return;
-                }
-                writer.sendString(EMPTY_STRING);
-            }
+            String rc = db.hget(args.key(), field);
+            writer.sendString(rc);
         }
 
         @CommandMethod(args = {"key"}, since="2.0.0", ro=true)
         protected void hgetall(Database db, Args args) throws IOException {
-
-            String key = args.get(0);
-
-            synchronized (db) {
-                Ageable a = db.get(key, false);
-                List<String> list = new ArrayList<String>();
-                if (null!=a) {
-                    Hash hash = (Hash) a.value;
-
-                    for (Entry<String, String> entry : hash.entrySet()) {
-                        list.add(entry.getKey());
-                        list.add(entry.getValue());
-                    }
-                }
-                writer.sendArray(list);
-            }
+            String key = args.key();
+            List<String> list = db.hgetall(key);
+            writer.sendArray(list);
         }
 
         @CommandMethod(args = {"key", "field", "amount"}, since="2.0.0")
         protected void hincrby(Database db, Args args) throws IOException {
-            _hincrBy(db, args, false);
+            String field = args.get(1);
+            long sum = db._hincrBy(args.key(), field, args);
+            writer.sendNumber(sum);
         }
 
         @CommandMethod(args = {"key", "field", "amount"}, since="2.6.0")
         protected void hincrbyfloat(Database db, Args args) throws IOException {
-            _hincrBy(db, args, true);
+            String key   = args.key();
+            String field = args.get(1);
+            double incr  = Double.parseDouble(args.get(2));
+            String string = db._hincrByFloat(key, field, incr);
+            writer.sendString(string);
         }
 
         @CommandMethod(args = {"key", "field"}, since="2.0.0", ro=true)
         protected void hexists(Database db, Args args) throws IOException {
-
-            String key = args.get(0);
+            String key = args.key();
             String field = args.get(1);
-
-            synchronized (db) {
-                Ageable a = db.get(key, false);
-                if (null!=a) {
-                    Hash h = (Hash) a.value;
-                    if (h.containsKey(field)) {
-                        writer.sendNumber(1);
-                        return;
-                    }
-                }
-                writer.sendNumber(0);
-            }
+            int rc = db.hexists(key, field);
+            writer.sendNumber(rc);
         }
 
         @CommandMethod(args = {}, since="1.0.0")
         protected void save(Database db, Args args) throws IOException {
-
             Persistifier pers = new Persistifier(RedisServer.this, "/tmp/radisj");
             pers.persist(databases);
-
             writer.write(OK_BYTES);
         }
 
@@ -1417,17 +1225,19 @@ public class RedisServer {
 
         @CommandMethod(args = {"key1", "key2", "...", "timeout"}, min=2, since="2.0.0")
         protected void blpop(Database db, Args args) throws IOException {
-            _bpop(db, true, args);
+            List<String> list = db.blpop(args);
+            writer.sendArray(list);
         }
 
         @CommandMethod(args = {"key"}, since="2.0.0")
         protected void brpop(Database db, Args args) throws IOException {
-            _bpop(db, false, args);
+            List<String> list = db.brpop(args);
+            writer.sendArray(list);
         }
 
         @CommandMethod(args={"key"}, min=1, since="1.0.0")
         protected void del(Database db, Args args) throws IOException {
-            String key = args.get(0);
+            String key = args.key();
             Ageable a = db.markDirty().remove(key);
             writer.sendNumber(notExpired(a) ? 1 : 0);
         }
@@ -1440,101 +1250,53 @@ public class RedisServer {
 
         @CommandMethod(args = {"key"}, since="1.0.0", ro=true)
         protected void ttl(Database db, Args args) throws IOException {
-
-            String key = args.get(0);
-            long ttl = -2;
-            Ageable a = db.get(key, false);
-            if (notExpired(a)) {
-                if (a.expires<0) {
-                    ttl = -1;
-                }
-                else {
-                    ttl = (now()-a.expires)/1000;
-                }
-            }
-            else {
-                ttl = -2;
-            }
-
+            String key = args.key();
+            long ttl = db.ttl(key);
             writer.sendNumber(ttl);
         }
 
         @CommandMethod(args = {"key"}, since="2.6.0", ro=true)
         protected void pttl(Database db, Args args) throws IOException {
-
-            String key = args.get(0);
-            long ttl = -2;
-            Ageable a = db.get(key, false);
-            if (notExpired(a)) {
-                if (a.expires<0) {
-                    ttl = -1;
-                }
-                else {
-                    ttl = (now()-a.expires);
-                }
-            }
-            else {
-                ttl = -2;
-            }
-
+            String key = args.key();
+            long ttl = db.pttl(key);
             writer.sendNumber(ttl);
         }
 
         @CommandMethod(args = {"key", "ttl"}, since="1.0.0")
         protected void expire(Database db, Args args) throws IOException {
-            String key  = args.get(0);
+            String key  = args.key();
             String ttl  = args.get(1);
             int    secs = Integer.parseInt(ttl);
-            Ageable a = db.get(key, false);
-            if (notExpired(a)) {
-                a.expires = now()+1000*secs;
-                writer.sendNumber(0);
-            }
-            else {
-                writer.sendNumber(1);
-            }
+            int rc = db.expire(key, secs);
+            writer.sendNumber(rc);
         }
 
         @CommandMethod(args = {"key", "ttl"}, since="1.0.0")
         protected void setex(Database db, Args args) throws IOException {
-            String key   = args.get(0);
             int    secs  = Integer.parseInt(args.get(1));
             String value = args.get(2);
-            Ageable a = db.get(key, false);
-            if (null==a) {
-                db.put(key, a = new Ageable(value));
-                a.expires = now()+1000*secs;
-                writer.sendNumber(1);
-            }
-            else {
-                writer.sendNumber(0);
-            }
+            int rc = db.setex(args.key(), secs, value);
+            writer.sendNumber(rc);
         }
 
         @CommandMethod(args = {"key", "ttl"}, since="1.0.0")
         protected void psetex(Database db, Args args) throws IOException {
-            String key   = args.get(0);
             int    millis  = Integer.parseInt(args.get(1));
             String value = args.get(2);
-            Ageable a = db.get(key, false);
-            if (null==a) {
-                db.put(key, a = new Ageable(value));
-                a.expires = now()+millis;
-                writer.sendNumber(1);
-            }
-            else {
-                writer.sendNumber(0);
-            }
+            int rc = db.psetex(args.key(), millis, value);
+            writer.sendNumber(rc);
         }
 
         @CommandMethod(args = {"key1", "val1", "key2", "val2"}, min=2, even=true, since="1.0.1")
         protected void mset(Database db, Args args) throws IOException {
-            _mset(db, args, false);
+            db.mset(args);
+            writer.write(OK_BYTES);
         }
 
         @CommandMethod(args = {"key1", "val1", "key2", "val2"}, min=2, even=true, since="1.0.1")
         protected void msetnx(Database db, Args args) throws IOException {
-            _mset(db, args, true);
+            int count = db.msetnx(args);
+            writer.sendNumber(count);
         }
 
         @CommandMethod(args = {}, db=false, since="1.0.0", ro=true)
@@ -1582,16 +1344,6 @@ public class RedisServer {
             writer.sendReply(sb);
         }
 
-        @CommandMethod(args = {"key", "cursor", "[MATCH pattern]"}, min=2, since="2.8.0")
-        protected void hscan(Database db, Args args) throws IOException {
-            _todo("hscan");
-        }
-
-        @CommandMethod(args = {}, since="1.0.0", ro=true)
-        protected void monitor(Database db, Args args) throws IOException {
-            _todo("monitor");
-        }
-
         @CommandMethod(args = {"[NOSAVE|SAVE]"}, min=0, max=1, since="1.0.0")
         protected void shutdown(Database db, Args args) throws IOException {
 
@@ -1614,6 +1366,16 @@ public class RedisServer {
             }
             onServerStopped("USERREQUEST");
             stop();
+        }
+
+        @CommandMethod(args = {"key", "cursor", "[MATCH pattern]"}, min=2, since="2.8.0")
+        protected void hscan(Database db, Args args) throws IOException {
+            _todo("hscan");
+        }
+
+        @CommandMethod(args = {}, since="1.0.0", ro=true)
+        protected void monitor(Database db, Args args) throws IOException {
+            _todo("monitor");
         }
 
         @CommandMethod(args = {}, since="1.0.0", ro=true)
@@ -1937,10 +1699,10 @@ public class RedisServer {
 
         @CommandMethod(args = {}, since="1.0.0", ro=true)
         protected void role(Database db, Args args) throws IOException {
-            @SuppressWarnings("serial")
-            ArrayList<String> list = new ArrayList<String>() {
-                { add("master"); add("0"); add(null); }
-            };
+            ArrayList<String> list = new ArrayList<String>();
+            list.add("master");
+            list.add("0");
+            list.add(null);
             writer.sendArray(list);
         }
 
@@ -1951,7 +1713,10 @@ public class RedisServer {
 
         @CommandMethod(args = {}, since="1.0.0")
         protected void sadd(Database db, Args args) throws IOException {
-            _todo("sadd");
+
+            String  key = args.remove(0);
+            int count = db.sadd(key, args);
+            writer.sendNumber(count);
         }
 
         @CommandMethod(args = {}, since="1.0.0")
@@ -2305,245 +2070,6 @@ public class RedisServer {
             writer.sendError("TODO", "Command '%s' not yet implemented", cmd);
         }
 
-        protected void _set(Database db, List<String> args, boolean nx) throws IOException {
-
-            assertArgCount(args, 2);
-            String key  = args.get(0);
-            String value = args.get(1);
-
-            if (nx) {
-                if (db.containsKey(key)) {
-                    writer.sendError("ERR", "Key exists");
-                    return;
-                }
-            }
-
-            db.put(key, new Ageable(value));
-            db.markDirty();
-            writer.write(OK_BYTES);
-        }
-
-        protected void _mset(Database db, List<String> args, boolean nx) throws IOException {
-
-            db.markDirty();
-            if (nx) {
-                for (int i=1; i<args.size(); i+=2) {
-
-                    String key = args.get(i);
-
-                    Ageable a = db.get(key, false);
-                    if (notExpired(a)) {
-                        logInfo("Key exists: " + key);
-                        writer.write(":0\r\n".getBytes());
-                        return;
-                    }
-                }
-            }
-
-            int count = 0;
-            for (int i=0; i<args.size(); i+=2) {
-
-                String key = args.get(i);
-                String val = args.get(i+1);
-
-                if (nx) {
-                    Ageable a = db.get(key, false);
-                    if (notExpired(a)) {
-                        logInfo("Key exists: " + key);
-                    }
-                }
-
-                db.put(key, new Ageable(val));
-                count ++;
-            }
-
-            if (nx) {
-                writer.sendNumber(count);
-            }
-            else {
-                writer.write(OK_BYTES);
-            }
-        }
-
-        protected void _incrDecr(Database db, String key, boolean incr, String amount, boolean _float) throws IOException {
-
-            db.markDirty();
-            Ageable a = db.get(key, false);
-            if (null==a) {
-                db.put(key, a = new Ageable("0"));
-            }
-
-            if (_float) {
-                Double b = (incr ? 1 : -1) * toDouble(amount);
-                String s = a.get();
-                Double l = toDouble(s)+b;
-                s = l.toString();;
-                a.value  = s;
-                writer.sendString(s);
-            }
-            else {
-                Long    b = (incr ? 1 : -1) * toLong(amount);
-                String  s = a.get();
-                Long    l = toLong(s)+b;
-                a.value = l.toString();;
-                writer.sendNumber(l);
-            }
-        }
-
-        protected void _hincrBy(Database db, Args args, boolean _float) throws IOException {
-
-            String key   = args.get(0);
-            String field = args.get(1);
-
-            synchronized (db) {
-                Ageable a = db.get(key, false);
-                Hash hash = null;
-                if (null==a) {
-                    db.put(key, new Ageable(hash = new Hash()));
-                }
-                else {
-                    hash = (Hash) a.value;
-                }
-
-                if (_float) {
-                    double incr = Double.parseDouble(args.get(2));
-                    String value = hash.getOrDefault(field, "0");
-                    double sum = Double.parseDouble(value)+incr;
-                    String string = Double.toString(sum);
-                    hash.put(field, string);
-                    writer.sendString(string);
-                }
-                else {
-                    long incr = Long.parseLong(args.get(2));
-                    String value = hash.getOrDefault(field, "0");
-                    long sum = Long.parseLong(value)+incr;
-                    String string = Long.toString(sum);
-                    hash.put(field, string);
-                    writer.sendNumber(sum);
-                }
-            }
-        }
-
-        protected void _bpop(Database db, boolean left, List<String> args) throws IOException {
-
-            String last = args.get(args.size()-1);
-            Long timeout = toLong(last);
-            long expires = (timeout>0) ? now()+1000*timeout : -1;
-
-            db.markDirty();
-            Object item = null;
-            boolean expired = false;
-            for (;!portListener.stopRequested && !expired;) {
-
-                for (int i=0, len=args.size()-1; i<len; i++) {
-
-                    String key = args.get(i);
-                    Ageable a = db.get(key, false);
-                    if (null!=a) {
-                        @SuppressWarnings("unchecked")
-                        List<Object> list = (List<Object>) a.value;
-                        if (list.size()>0) {
-                            if (left) {
-                                item = list.remove(0);
-                            }
-                            else {
-                                item = list.remove(list.size()-1);
-                            }
-                        }
-                    }
-
-                    if (null!=item) {
-                        writer.sendArray(key, item.toString());
-                        return;
-                    }
-
-                    if (timeout>0 && now()>expires) {
-                        expired = true;
-                    }
-
-                    if (portListener.stopRequested || expired) {
-                        break;
-                    }
-
-                    try {
-                        Thread.sleep(100);
-                    } catch (InterruptedException e) {
-                        e.printStackTrace();
-                    }
-                }
-            }
-
-            writer.write(EMPTY_BYTES);
-        }
-
-        protected void _pop(Database db, String key, boolean left) throws IOException {
-            db.markDirty();
-            Object item = null;
-            Ageable a = db.get(key, false);
-            if (null!=a) {
-                @SuppressWarnings("unchecked")
-                List<Object> list = (List<Object>) a.value;
-                if (list.size()>0) {
-                    if (left) {
-                        item = list.remove(0);
-                    }
-                    else {
-                        item = list.remove(list.size()-1);
-                    }
-                }
-            }
-
-            if (null==item) {
-                writer.write(EMPTY_BYTES);
-            }
-            else {
-                writer.sendString(item.toString());
-            }
-        }
-
-        protected void _push(Database db, String key, String val, boolean left) throws IOException {
-            Ageable a = db.get(key, false);
-            if (null==a) {
-                db.put(key, a = new Ageable(new ArrayList<Object>()));
-                db.markDirty();
-            }
-
-            @SuppressWarnings("unchecked")
-            List<Object> list = (List<Object>) a.value;
-            db.markDirty();
-            if (left) {
-                list.add(0, val);
-            }
-            else {
-                list.add(val); /// at end
-            }
-            writer.sendNumber(list.size());
-        }
-
-        protected void _hset(Database db, String key, String field, String value, boolean nx) throws IOException {
-
-            synchronized (db) {
-                Ageable a = db.get(key, false);
-                Hash hash = null;
-                if (null==a) {
-                    db.markDirty();
-                    db.put(key, new Ageable(hash = new Hash()));
-                }
-                else {
-                    hash = (Hash) a.value;
-                }
-
-                if (nx && hash.contains(field)) {
-                    writer.sendNumber(0);
-                }
-                else {
-                    db.markDirty();
-                    hash.put(field, value);
-                    writer.sendNumber(1);
-                }
-            }
-
-        }
 
         protected void kill() {
             try {
@@ -2573,24 +2099,6 @@ public class RedisServer {
             }
         }
 
-        protected Pattern createRegexFromGlob(String glob) {
-            String out = "^";
-            for(int i = 0; i < glob.length(); ++i)
-            {
-                final char c = glob.charAt(i);
-                switch(c)
-                {
-                case '*': out += ".*"; break;
-                case '?': out += '.'; break;
-                case '.': out += "\\."; break;
-                case '\\': out += "\\\\"; break;
-                default: out += c;
-                }
-            }
-            out += '$';
-            return Pattern.compile(out);
-        }
-
         protected Database getSelectedDb() {
             return RedisServer.this.getDb(selectedDb);
         }
@@ -2599,9 +2107,15 @@ public class RedisServer {
             return null==s ? null : Long.parseLong(s);
         }
 
+        protected Integer toInt(String s) {
+            return null==s ? null : Integer.parseInt(s);
+        }
+
         protected Double toDouble(String s) {
             return null==s ? null : Double.parseDouble(s);
         }
+
+        protected String lastCommand;
 
         protected String clientName;
         protected int selectedDb;
@@ -2610,10 +2124,6 @@ public class RedisServer {
 
         protected RESPWriter writer;
         protected Socket socket;
-        final int NIBBLE_BITS[] = {
-                0, 1, 1, 2, 1, 2, 2, 3,
-                1, 2, 2, 3, 2, 3, 3, 4
-        };
     }
 
     /**
@@ -2631,6 +2141,11 @@ public class RedisServer {
             this.socket = socket;
         }
 
+        public RESPReader withNonStandard(boolean b) {
+            nonStandard = b;
+            return this;
+        }
+
         public Object readStringOrList() throws IOException {
 
             String line = br.readLine();
@@ -2644,10 +2159,13 @@ public class RedisServer {
             else if (line.startsWith("*")) {
                 return readList(count);
             }
-            else if (line.startsWith("#")) {
+            else if (line.startsWith("#") && nonStandard) {
                 return readHash(count);
             }
-            throw new RESPException("Expected $ or * but got " + truncateString(line));
+            else if (line.startsWith("%") && nonStandard) {
+                return readSet(count);
+            }
+            throw new RESPException("Expected character out of ['$','*','#','%'] but found " + truncateString(line));
         }
 
         public String readString() throws IOException {
@@ -2712,6 +2230,15 @@ public class RedisServer {
             return hash;
         }
 
+        protected _Set readSet(int count) throws IOException {
+            _Set hash = new _Set(count);
+            for (int i=0; i<count; i++) {
+                String value = readString();
+                hash.add(value);
+            }
+            return hash;
+        }
+
         protected String readString(int length) throws IOException {
             char[] cbuf = new char[length];
             readComplete(cbuf);
@@ -2749,6 +2276,8 @@ public class RedisServer {
 
         private BufferedReader br;
         private Socket socket;
+        private boolean nonStandard;
+
     }
 
     /**
@@ -2801,7 +2330,18 @@ public class RedisServer {
             }
         }
 
-        public void sendArray(List<String> strings) throws IOException {
+        public void sendSet(_Set set) throws IOException {
+            sendSetLength(set.size());
+            for (String member : set) {
+                sendString(member);
+            }
+        }
+
+        public void sendArray(Collection<String> strings) throws IOException {
+            if (null==strings) {
+                write(EMPTY_BYTES);
+                return;
+            }
             sendArrayLength(strings.size());
             for (String s : strings) {
                 if (null==s) {
@@ -2820,6 +2360,11 @@ public class RedisServer {
 
         public void sendHashLength(int len) throws IOException {
             output.write(("#" + len).getBytes());
+            output.write(CRLF_BYTES);
+        }
+
+        public void sendSetLength(int len) throws IOException {
+            output.write(("%" + len).getBytes());
             output.write(CRLF_BYTES);
         }
 
@@ -3027,6 +2572,12 @@ public class RedisServer {
                         writer.sendNumber(a.expires);
                         writer.sendHash(hash);
                     }
+                    else if (obj instanceof _Set) {
+                        _Set set = (_Set) obj;
+                        writer.sendString(key);
+                        writer.sendNumber(a.expires);
+                        writer.sendSet(set);
+                    }
                     else {
                         throw new RuntimeException("Unsupported type " + obj.getClass());
                     }
@@ -3074,7 +2625,7 @@ public class RedisServer {
             }
 
             FileInputStream fis = new FileInputStream(file);
-            RESPReader reader = new RESPReader(fis);
+            RESPReader reader = new RESPReader(fis).withNonStandard(true);
 
             Database db = new Database(num);
             boolean done = false;
@@ -3121,19 +2672,271 @@ public class RedisServer {
             this.number = number;
         }
 
-        public Database markDirty() {
-            this.dirty = true;
+        public long dbsize() {
+            return size();
+        }
+
+        public Database flushDb() {
+            clear();
             return this;
+        }
+
+        public void mset(List<String> args) throws IOException {
+            markDirty();
+            for (int i=0; i<args.size(); i+=2) {
+                String key = args.get(i);
+                String val = args.get(i+1);
+                put(key, new Ageable(val));
+            }
+        }
+
+        public List<String> hmget(String key, Args args) {
+            Ageable a = get(key, false);
+            List<String> list = new ArrayList<String>();
+            if (null!=a) {
+                Hash hash = (Hash) a.value;
+                for (int i=1, len=args.size(); i<len; i++) {
+                    String value = hash.get(args.get(i));
+                    list.add(value);
+                }
+            }
+            return list;
+        }
+
+        public int llen(String key) {
+            Ageable a = get(key, false);
+            int len = 0;
+            if (null!=a) {
+                List<Object> list = a.get();
+                len = list.size();
+            }
+            return len;
+        }
+
+        public List<String> mget(Args args) {
+            List<String> values = new ArrayList<String>(args.size());
+            for (String key : args) {
+                Ageable a = get(key, false);
+                if (null==a) {
+                    values.add(null);
+                }
+                else {
+                    String string = a.get();
+                    values.add(string);
+                }
+            }
+            return values;
+        }
+
+        public int msetnx(List<String> args) throws IOException {
+
+            markDirty();
+            for (int i=1; i<args.size(); i+=2) {
+                String key = args.get(i);
+                Ageable a = get(key, false);
+                if (notExpired(a)) {
+                    return 0;
+                }
+            }
+
+            int count = 0;
+            for (int i=0; i<args.size(); i+=2) {
+                String key = args.get(i);
+                String val = args.get(i+1);
+                put(key, new Ageable(val));
+                count ++;
+            }
+
+            //writer.sendNumber(count);
+            return count;
+        }
+
+        public int psetex(String key, int millis, String value) {
+            Ageable a = get(key, false);
+            int rc = 0;
+            if (null==a) {
+                put(key, a = new Ageable(value));
+                a.expires = now()+millis;
+                rc = 1;
+            }
+            else {
+                rc = 0;
+            }
+            return rc;
+        }
+
+
+        public int setex(String key, int secs, String value) {
+            Ageable a = get(key, false);
+            int rc = 0;
+            if (null==a) {
+                put(key, a = new Ageable(value));
+                a.expires = now()+1000*secs;
+                rc = 1;
+            }
+            else {
+                rc = 0;
+            }
+            return rc;
+        }
+
+        public String type(String key) {
+            String type  = null;
+            Ageable a = get(key, false);
+            if (notExpired(a)) {
+                Object value = a.value;
+                if (value instanceof String) {
+                    type = "string";
+                }
+                else if (value instanceof List) {
+                    type = "list";
+                }
+                else if (value instanceof Set) {
+                    type = "set";
+                }
+                else if (value instanceof Map) {
+                    type = "hash";
+                }
+                else if (value instanceof ZSet) {
+                    type = "zset";
+                }
+            }
+            return type;
+        }
+
+        public long append(String key, String value) {
+            Ageable a = get(key, false);
+            long len = 0;
+            if (null==a) {
+                put(key, new Ageable(value));
+                len = value.length();
+            }
+            else {
+                String s = a.value.toString() + value;
+                a.value = s;
+                len = s.length();
+            }
+            return len;
+        }
+
+        public double incrbyfloat(String key, double amount) {
+            Ageable a = markDirty().get(key, false);
+            if (null==a) {
+                put(key, a = new Ageable("0"));
+            }
+
+            String s = a.get();
+            Double l = toDouble(s)+amount;
+            s = l.toString();
+            a.value  = s;
+            return l;
+        }
+
+        public boolean exists(String key) {
+            Ageable a = get(key, false);
+            return null!=a;
+        }
+
+        public Collection<String> keys(String glob) {
+            Pattern rex = createRegexFromGlob(glob);
+            ArrayList<String> matches = new ArrayList<String>();
+
+            for (String key : keySet()) {
+                if (rex.matcher(key).matches()) {
+                    matches.add(key);
+                }
+            }
+            return matches;
+        }
+
+        public int hset(String key, String field, String value) {
+            return _hset(key, field, value, false);
+        }
+
+        public int hsetnx(String key, String field, String value) {
+            return _hset(key, field, value, true);
+        }
+
+        public int bitcount(String key) throws IOException {
+
+            int count = 0;
+            Ageable a = get(key, false);
+            if (null!=a) {
+                String s = a.get();
+                for (int i=0, len=s.length(); i<len; i++) {
+                    char c = s.charAt(i);
+                    int upper = ((byte)c) >> 4;
+                    int lower = ((byte)c) & 0x0f;
+                    count += NIBBLE_BITS[upper] + NIBBLE_BITS[lower];
+                }
+            }
+            return count;
+        }
+
+        @CommandMethod(args= {"key", "offset"}, since="2.2.0", ro=true)
+        public int getbit(String key, int off) throws IOException {
+
+            //String key = args.key();
+            int value = 0;
+            Ageable a = get(key, false);
+            if (null!=a) {
+                String s = a.get();
+                //int off = Integer.parseInt(args.get(1));
+                int pos = off/8;
+                char c = (null==s || pos>=s.length()) ? 0 : s.charAt(pos);
+                byte mask = (byte)(0x80 >> (off%8));
+                if ((mask & c) > 0) {
+                    value = 1;
+                }
+            }
+            return value;
+        }
+
+        public int sadd(String key, String ... members) {
+            List<String> list = Arrays.asList(members);
+            return sadd(key, list);
+        }
+
+        public int sadd(String key, Collection<String> members) {
+
+            Ageable age = get(key, false);
+            _Set    set = null;
+            if (null==age) {
+                put(key, age = new Ageable(set = new _Set(members.size())));
+            }
+            else {
+                set = age.get();
+            }
+            int before = set.size();
+            set.addAll(members);
+            int after = set.size();
+            return after-before;
         }
 
         public int getNumber() {
             return number;
         }
 
-        public void set(String ... keyValues) {
-            for (int i=0, len=keyValues.length; i<len; i+=2) {
-                super.put(keyValues[i], new Ageable(keyValues[i+1]));
+        public void set(String key, String value) {
+            put(key, new Ageable(value));
+        }
+
+        public boolean setnx(String key, String value) throws IOException {
+            if (containsKey(key)) {
+                return false;
             }
+            markDirty().put(key, new Ageable(value));
+            return false;
+        }
+
+        public Database markDirty() {
+            this.dirty = true;
+            return this;
+        }
+
+        public String get(String key) {
+            Ageable a = get(key, false);
+            return null==a ? null : (String) a.value;
         }
 
         public Ageable get(String key, boolean returnExpired) {
@@ -3144,17 +2947,357 @@ public class RedisServer {
             return null;
         }
 
-        public <T> T get(String key) {
+        public long ttl(String key) {
+            long ttl = -2;
             Ageable a = get(key, false);
-            Object o = null==a ? null : a.value;
+            if (notExpired(a)) {
+                if (a.expires<0) {
+                    ttl = -1;
+                }
+                else {
+                    ttl = (now()-a.expires)/1000;
+                }
+            }
+            else {
+                ttl = -2;
+            }
+            return ttl;
+        }
+
+        public long pttl(String key) {
+            long ttl = -2;
+            Ageable a = get(key, false);
+            if (notExpired(a)) {
+                if (a.expires<0) {
+                    ttl = -1;
+                }
+                else {
+                    ttl = (now()-a.expires);
+                }
+            }
+            else {
+                ttl = -2;
+            }
+            return ttl;
+        }
+
+        public int expire(String key, int secs) {
+            int rc = 0;
+            Ageable a = get(key, false);
+            if (notExpired(a)) {
+                a.expires = now()+1000*secs;
+                rc = 0;
+            }
+            else {
+                rc = 1;
+            }
+            return rc;
+        }
+
+        public int hexists(String key, String field) {
+            int rc = 0;
+                Ageable a = get(key, false);
+                if (null!=a) {
+                    Hash h = (Hash) a.value;
+                    if (h.containsKey(field)) {
+                        rc = 1;
+                    }
+                }
+            return rc;
+        }
+
+        public void hmset(String key, List<String> keyVal) {
+            Ageable a = get(key, false);
+            Hash hash = null;
+            if (null==a) {
+                put(key, new Ageable(hash = new Hash()));
+            }
+            else {
+                hash = a.get();
+            }
+            for (int i=0, len=keyVal.size(); i<len; i+=2) {
+                hash.put(keyVal.get(i), keyVal.get(i+1));
+            }
+        }
+
+
+        public List<String> hkeys(String key) {
+            Ageable a = get(key, false);
+            List<String> list = new ArrayList<String>();
+            if (null!=a) {
+                Hash hash = (Hash) a.value;
+                for (String field : hash.keySet()) {
+                    list.add(field);
+                }
+            }
+            return list;
+        }
+
+        public List<String> hvals(String key) {
+            Ageable a = get(key, false);
+            List<String> list = new ArrayList<String>();
+            if (null!=a) {
+                Hash hash = (Hash) a.value;
+                for (String field : hash.values()) {
+                    list.add(field);
+                }
+            }
+            return list;
+        }
+
+        public int hdel(String key, Args args) {
+            Ageable a = get(key, false);
+            int count = 0;
+            if (null!=a) {
+                Hash hash = (Hash) a.value;
+                for (int i=0; i<args.size(); i++) {
+                    String field = args.get(i);
+                    if (hash.contains(field)) {
+                        hash.remove(field);
+                        count++;
+                    }
+                }
+            }
+            return count;
+        }
+
+        public int hlen(String key) {
+            int rc = 0;
+            Ageable a = get(key, false);
+            if (null!=a) {
+                Hash hash = (Hash) a.value;
+                rc = hash.size();
+            }
+            return rc;
+        }
+
+        public int hstrlen(String key, String field) throws IOException {
+            int rc = -1;
+            Ageable a = get(key, false);
+            if (null!=a) {
+                Hash hash = (Hash) a.value;
+                String value = hash.get(field);
+                rc = value.length();
+            }
+            return rc;
+        }
+
+        public List<Object> lpush(String key, String val) {
+            return _push(key, val, true);
+        }
+
+        public List<Object> rpush(String key, String val) {
+            return _push(key, val, false);
+        }
+
+        public String hget(String key, String field) {
+            String rc = EMPTY_STRING;
+
+                Ageable a = get(key, false);
+                if (null!=a) {
+                    Hash hash = (Hash) a.value;
+                    rc = hash.get(field);
+                }
+            return rc;
+        }
+
+        public List<String> hgetall(String key) {
+            Ageable a = get(key, false);
+            List<String> list = new ArrayList<String>();
+            if (null!=a) {
+                Hash hash = (Hash) a.value;
+
+                for (Entry<String, String> entry : hash.entrySet()) {
+                    list.add(entry.getKey());
+                    list.add(entry.getValue());
+                }
+            }
+            return list;
+        }
+
+        public String lpop(String key) {
+            return _pop(key, true);
+        }
+
+        public String rpop(String key) {
+            return _pop(key, false);
+        }
+
+        public List<String> blpop(List<String> args) throws IOException {
+            return _bpop(true, args);
+        }
+
+        public List<String> brpop(List<String> args) throws IOException {
+            return _bpop(false, args);
+        }
+
+        private List<String> _bpop(boolean left, List<String> args) throws IOException {
+
+            String last = args.get(args.size()-1);
+            Long timeout = toLong(last);
+            long expires = (timeout>0) ? now()+1000*timeout : -1;
+
+            markDirty();
+            String item = null;
+            boolean expired = false;
+            for (;!portListener.stopRequested && !expired;) {
+
+                for (int i=0, len=args.size()-1; i<len; i++) {
+
+                    String key = args.get(i);
+                    Ageable a = get(key, false);
+                    if (null!=a) {
+                        @SuppressWarnings("unchecked")
+                        List<String> list = (List<String>) a.value;
+                        if (list.size()>0) {
+                            if (left) {
+                                item = list.remove(0);
+                            }
+                            else {
+                                item = list.remove(list.size()-1);
+                            }
+                        }
+                    }
+
+                    if (null!=item) {
+                        ArrayList<String> list = new ArrayList<String>();
+                        list.add(key);
+                        list.add(item);
+                        return list;
+                    }
+
+                    if (timeout>0 && now()>expires) {
+                        expired = true;
+                    }
+
+                    if (portListener.stopRequested || expired) {
+                        break;
+                    }
+
+                    try {
+                        Thread.sleep(100);
+                    } catch (InterruptedException e) {
+                        e.printStackTrace();
+                    }
+                }
+            }
+
+            return null;
+        }
+
+        private List<Object> _push(String key, String val, boolean left) {
+
+            markDirty();
+            Ageable a = get(key, false);
+            if (null==a) {
+                put(key, a = new Ageable(new ArrayList<Object>()));
+            }
+
             @SuppressWarnings("unchecked")
-            T t = (T) o;
-            return t;
+            List<Object> list = (List<Object>) a.value;
+            if (left) {
+                list.add(0, val);
+            }
+            else {
+                list.add(val); /// at end
+            }
+            return list;
+        }
+
+        private String _pop(String key, boolean left) {
+            markDirty();
+            String item = null;
+            Ageable a = get(key, false);
+            if (null!=a) {
+                @SuppressWarnings("unchecked")
+                List<String> list = (List<String>) a.value;
+                if (list.size()>0) {
+                    if (left) {
+                        item = list.remove(0);
+                    }
+                    else {
+                        item = list.remove(list.size()-1);
+                    }
+                }
+            }
+            return item;
+        }
+
+        private long _hincrBy(String key, String field, Args args) {
+            Ageable a = get(key, false);
+            Hash hash = null;
+            if (null==a) {
+                put(key, new Ageable(hash = new Hash()));
+            }
+            else {
+                hash = (Hash) a.value;
+            }
+
+            long incr = Long.parseLong(args.get(2));
+            String value = hash.getOrDefault(field, "0");
+            long sum = Long.parseLong(value)+incr;
+            String string = Long.toString(sum);
+            hash.put(field, string);
+            return sum;
+        }
+
+        private Long _incrDecr(String key, boolean incr, String amount) {
+            markDirty();
+            Ageable a = get(key, false);
+            if (null==a) {
+                put(key, a = new Ageable("0"));
+            }
+
+            Long    b = (incr ? 1 : -1) * toLong(amount);
+            String  s = a.get();
+            Long    l = toLong(s)+b;
+            a.value = l.toString();;
+            return l;
+        }
+
+        private String _hincrByFloat(String key, String field, double incr) {
+
+            Ageable a = get(key, false);
+            Hash hash = null;
+            if (null==a) {
+                put(key, new Ageable(hash = new Hash()));
+            }
+            else {
+                hash = (Hash) a.value;
+            }
+
+            //double incr = Double.parseDouble(args.get(2));
+            String value = hash.getOrDefault(field, "0");
+            double sum = Double.parseDouble(value)+incr;
+            String string = Double.toString(sum);
+            hash.put(field, string);
+            return string;
+        }
+
+        private int _hset(String key, String field, String value, boolean nx) {
+            Ageable a = get(key, false);
+            Hash hash = null;
+            if (null==a) {
+                markDirty().put(key, new Ageable(hash = new Hash()));
+            }
+            else {
+                hash = (Hash) a.value;
+            }
+
+            if (nx && hash.contains(field)) {
+                return 0;
+            }
+            else {
+                markDirty();
+                hash.put(field, value);
+                return 1;
+            }
         }
 
         protected int number;
         protected boolean dirty;
     }
+
 
     /**
      * This class represents a single key/value pair in a Redis database along
@@ -3189,6 +3332,15 @@ public class RedisServer {
 
     // TODO: Implement support for ZSet, Hash, Bits, Sets
     class ZSet {
+    }
+
+    @SuppressWarnings("serial")
+    class _Set extends LinkedHashSet<String>{
+
+        public _Set(int count) {
+            super(count);
+        }
+
     }
 
     @SuppressWarnings("serial")
@@ -3271,6 +3423,15 @@ public class RedisServer {
             }
         }
 
+        public Args add(String ... strings) {
+            if (null!=strings) {
+                for (String s : strings) {
+                    add(s);
+                }
+            }
+            return this;
+        }
+
         public String key() {
             return get(0);
         }
@@ -3325,6 +3486,24 @@ public class RedisServer {
         // TODO: Use info whether a methoid is R/O only.
         boolean ro() default false;
     }
+    protected Pattern createRegexFromGlob(String glob) {
+        String out = "^";
+        for(int i = 0; i < glob.length(); ++i)
+        {
+            final char c = glob.charAt(i);
+            switch(c)
+            {
+            case '*': out += ".*"; break;
+            case '?': out += '.'; break;
+            case '.': out += "\\."; break;
+            case '\\': out += "\\\\"; break;
+            default: out += c;
+            }
+        }
+        out += '$';
+        return Pattern.compile(out);
+    }
+
 
     static final String CN = RedisServer.class.getSimpleName();
 
@@ -3337,6 +3516,11 @@ public class RedisServer {
     protected static final byte[] OK_BYTES   = "+OK\r\n".getBytes();
     protected static final byte[] NONE_BYTES = "+none\r\n".getBytes();
 
+    final int NIBBLE_BITS[] = {
+            0, 1, 1, 2, 1, 2, 2, 3,
+            1, 2, 2, 3, 2, 3, 3, 4
+    };
+
     protected Map<String, WorkerMethod> methodCache = new HashMap<String, RedisServer.WorkerMethod>();
 
     protected List<RedisListener> commandListeners = new ArrayList<RedisListener>();
@@ -3345,7 +3529,6 @@ public class RedisServer {
 
     protected LinkedHashSet<Worker> workers = new LinkedHashSet<Worker>();
 
-    protected volatile boolean acceptingConnections = false;
     protected long totalConnectionsReceived;
     protected long totalCommandsProcessed;
     protected long clientLongestOutputList;
@@ -3359,6 +3542,9 @@ public class RedisServer {
     protected PortListener portListener;
     protected StartupThread startupThread;
     protected int threadPoolSize = DEFAULT_THREAD_POOL_SIZE;
+    protected volatile boolean acceptingConnections = false;
+
     protected volatile boolean stopRequested;
     protected String version;
+
 }

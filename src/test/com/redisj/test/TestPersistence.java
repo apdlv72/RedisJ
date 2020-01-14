@@ -1,17 +1,8 @@
 package com.redisj.test;
 
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.assertNull;
-import static org.junit.Assert.assertTrue;
-import static org.junit.Assert.fail;
 
 import java.io.IOException;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
 
 import org.junit.AfterClass;
 import org.junit.Before;
@@ -19,9 +10,7 @@ import org.junit.BeforeClass;
 import org.junit.Test;
 
 import com.redisj.RedisServer;
-
-import redis.clients.jedis.Jedis;
-import redis.clients.jedis.exceptions.JedisDataException;
+import com.redisj.RedisServer.Database;
 
 public class TestPersistence {
 
@@ -53,16 +42,24 @@ public class TestPersistence {
 
     @Test
     public void testString() throws IOException {
-        server.flushDb(0);
-        server.set(0, "key", "value");
+        Database db = server.select(0).flushDb();
+        db.set("key", "value");
         server.persist(0);
     }
 
     @Test
     public void testHash() throws IOException {
-        server.flushDb(0);
-        String resp = server.hset(0, "key", "field", "value");
-        assertEquals(":1\r\n", resp);
+        Database db = server.select(0).flushDb();
+        int resp = db.hset("key", "field", "value");
+        assertEquals(1, resp);
+        server.persist(0);
+    }
+
+    @Test
+    public void testSet() throws IOException {
+        Database db = server.select(0).flushDb();
+        int resp = db.sadd("key", "member1", "member2");
+        assertEquals(2, resp);
         server.persist(0);
     }
 
