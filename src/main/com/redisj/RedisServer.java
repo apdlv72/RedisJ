@@ -2295,6 +2295,12 @@ public class RedisServer {
             _todo("latency");
         }
 
+        /**
+         * This method is a placeholder for any method corresponding to a Redis command
+         * not (yet) implemented/supported.
+         * @param cmd
+         * @throws IOException
+         */
         protected void _todo(String cmd) throws IOException {
             writer.sendError("TODO", "Command '%s' not yet implemented", cmd);
         }
