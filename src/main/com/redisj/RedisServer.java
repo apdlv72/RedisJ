@@ -32,6 +32,11 @@ import java.util.TreeMap;
 import java.util.TreeSet;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.regex.Pattern;
 
 /**
@@ -49,7 +54,10 @@ import java.util.regex.Pattern;
 public class RedisServer {
 
     public static void main(String[] args) throws IOException {
-        RedisServer server = new RedisServer().withPersistence();
+        boolean locking = true;
+        RedisServer server = new RedisServer(locking)
+                .withPersistence()
+                ;
         try {
             server.serveForEver(true);
             boolean ok = server.waitUntilAcceptingConnection(5000);
@@ -77,18 +85,32 @@ public class RedisServer {
 
     public static final String DEFAULT_WORKDIR = ".redisj";
 
+    public static boolean DEFAULT_LOCKING = true;
+
     public RedisServer() {
-        this(DEFAULT_PORT, DEFAULT_MAX_DB);
+        this(DEFAULT_LOCKING);
+    }
+
+    public RedisServer(boolean locking) {
+        this(DEFAULT_PORT, DEFAULT_MAX_DB, locking);
     }
 
     public RedisServer(int port) {
-        this(port, DEFAULT_MAX_DB);
+        this(port, DEFAULT_LOCKING);
+    }
+
+    public RedisServer(int port, boolean locking) {
+        this(port, DEFAULT_MAX_DB, locking);
     }
 
     public RedisServer(int port, int maxDb) {
+        this(port, maxDb, DEFAULT_LOCKING);
+    }
+
+    public RedisServer(int port, int maxDb, boolean locking) {
         this.port  = port;
         this.maxDb = maxDb;
-        databases = new TreeMap<Integer, Database>();
+        databases = new Databases(locking);
     }
 
     public RedisServer withPersistence(File persDir) {
@@ -176,18 +198,25 @@ public class RedisServer {
     }
 
     public void flushAll() {
-        synchronized (databases) {
-
+        databases.lockWriter();
+        try {
             Set<Integer> dbs = new TreeSet<Integer>(databases.keySet());
             for (int dbNumber : dbs) {
                 Database db = databases.get(dbNumber);
                 if (null!=db) {
-                    synchronized (db) {
+                    db.lockWriter();
+                    try {
                         db.markDirty().clear();
+                    }
+                    finally {
+                        db.unlockWriter();
                     }
                 }
                 onAfterCommand(dbNumber, 0, "FLUSH", null);
             }
+        }
+        finally {
+            databases.unlockWriter();
         }
         onAfterCommand(-1, 0, "FLUSH", null);
     }
@@ -221,12 +250,16 @@ public class RedisServer {
     }
 
     public Database getDb(int num) {
-        synchronized (databases) {
+        databases.lockReader();
+        try {
             Database db = databases.get(num);
             if (null==db) {
-                databases.put(num, db=new Database(num));
+                databases.put(num, db=new Database(num, locking));
             }
             return db;
+        }
+        finally {
+            databases.unlockReader();
         }
     }
 
@@ -654,6 +687,7 @@ public class RedisServer {
             this.args = anno.args().length;
             this.even = anno.even();
             this.odd  = anno.odd();
+            this.ro   = anno.ro();
         }
 
         String checkArguments(Args args) {
@@ -687,11 +721,24 @@ public class RedisServer {
             try {
                 if (this.db) {
                     db = worker.getSelectedDb();
+                    if (this.ro) {
+                        db.lockReader();
+                    }
+                    else {
+                        db.lockWriter();
+                    }
                 }
                 method.invoke(worker, db, args);
             }
             finally {
-                // TODO: unlock db
+                if (null!=db) {
+                    if (this.ro) {
+                        db.unlockReader();
+                    }
+                    else {
+                        db.unlockWriter();
+                    }
+                }
             }
         }
 
@@ -704,6 +751,7 @@ public class RedisServer {
         private boolean odd;
         //private RedisCommand anno;
         private Method method;
+        private boolean ro;
     }
 
     /**
@@ -889,8 +937,12 @@ public class RedisServer {
 
         @CommandMethod(args = {"[ASYNC]"}, min=0, max=1, since="1.0.0", db=false)
         protected void flushall(Database db, Args args) throws IOException {
-            synchronized (databases) {
+            databases.lockWriter();
+            try {
                 databases.clear();
+            }
+            finally {
+                databases.unlockWriter();
             }
         }
 
@@ -1024,26 +1076,22 @@ public class RedisServer {
 
         @CommandMethod(args = {"key", "amout"}, since="1.0.0")
         protected void decrby(Database db, Args args) throws IOException {
-            long l = db._incrDecr(args.key(), false, args.get(1));
-            writer.sendNumber(l);
+            writer.sendNumber(db.decrby(args.key(), toLong(args.get(1))));
         }
 
         @CommandMethod(args = {"key", "amout"}, since="1.0.0")
         protected void incrby(Database db, Args args) throws IOException {
-            long l = db._incrDecr(args.key(), true, args.get(1));
-            writer.sendNumber(l);
+            writer.sendNumber(db.incrby(args.key(), toLong(args.get(1))));
         }
 
         @CommandMethod(args = {"key"}, since="1.0.0")
         protected void decr(Database db, Args args) throws IOException {
-            long l = db._incrDecr(args.key(), false, "1");
-            writer.sendNumber(l);
+            writer.sendNumber(db.decr(args.key()));
         }
 
         @CommandMethod(args = {"key"}, since="1.0.0")
         protected void incr(Database db, Args args) throws IOException {
-            long l = db._incrDecr(args.key(), true, "1");
-            writer.sendNumber(l);
+            writer.sendNumber(db.incr(args.key()));
         }
 
         @CommandMethod(args = {"subcmd", "[option]"}, min=1, max=2, since="2.4.0")
@@ -1108,9 +1156,15 @@ public class RedisServer {
             writer.sendString(message);
         }
 
+        @CommandMethod(args = {}, since="1.0.0", ro=true)
+        protected void strlen(Database db, Args args) throws IOException {
+            int len = db.strlen(args.key());
+            writer.sendNumber(len);
+        }
+
         @CommandMethod(args = {"key", "field", "value"}, since="2.0.0")
         protected void hset(Database db, Args args) throws IOException {
-            String key = args.key();
+            String key   = args.key();
             String field = args.get(1);
             String value = args.get(2);
             int rc = db.hset(key, field, value);
@@ -1161,8 +1215,7 @@ public class RedisServer {
 
         @CommandMethod(args = {"key"}, since="2.0.0", ro=true)
         protected void hlen(Database db, Args args) throws IOException {
-            String key = args.key();
-            int rc = db.hlen(key);
+            int rc = db.hlen(args.key());
             writer.sendNumber(rc);
         }
 
@@ -1213,9 +1266,15 @@ public class RedisServer {
 
         @CommandMethod(args = {}, since="1.0.0")
         protected void save(Database db, Args args) throws IOException {
-            Persistifier pers = new Persistifier(RedisServer.this, "/tmp/radisj");
-            pers.persist(databases);
-            writer.write(OK_BYTES);
+            databases.lockWriter();
+            try {
+                Persistifier pers = new Persistifier(RedisServer.this, "/tmp/radisj");
+                pers.persist(databases);
+                writer.write(OK_BYTES);
+            }
+            finally {
+                databases.unlockWriter();
+            }
         }
 
         @CommandMethod(args = {}, min=0, max=1, since="1.0.0", ro=true)
@@ -1302,46 +1361,53 @@ public class RedisServer {
         @CommandMethod(args = {}, db=false, since="1.0.0", ro=true)
         protected void info(Database unused, Args args) throws IOException {
 
-            StringBuilder sb = new StringBuilder();
+            databases.lockReader();
+            try {
 
-            long uptimeSeconds = (now()-startTime)/1000;
-            int connectedClients = workers.size();
+                StringBuilder sb = new StringBuilder();
 
-            sb.append("# Server\r\n");
-            sb.append("redis_version:");
-            sb.append(null==version ? "2.0.0" : version);
-            sb.append(" ***** THIS IS NOT REAL REDIS BUT REDISJ - A VERY BASIC JAVA PORT *****\r\n");
-            sb.append(String.format("tcp_port:%d\r\n", port));
-            sb.append(String.format("uptime_in_seconds:%d\r\n", uptimeSeconds));
-            sb.append(CRLF_STRING);
+                long uptimeSeconds = (now()-startTime)/1000;
+                int connectedClients = workers.size();
 
-            sb.append("# Stats\r\n");
-            sb.append(String.format("total_connections_received:%d\r\n", totalConnectionsReceived));
-            sb.append(String.format("total_commands_processed:%d\r\n", totalCommandsProcessed));
-            sb.append(CRLF_STRING);
+                sb.append("# Server\r\n");
+                sb.append("redis_version:");
+                sb.append(null==version ? "2.0.0" : version);
+                sb.append(" ***** THIS IS NOT REAL REDIS BUT REDISJ - A VERY BASIC JAVA PORT *****\r\n");
+                sb.append(String.format("tcp_port:%d\r\n", port));
+                sb.append(String.format("uptime_in_seconds:%d\r\n", uptimeSeconds));
+                sb.append(CRLF_STRING);
 
-            sb.append("# Clients\r\n");
-            sb.append(String.format("connected_clients:%d\r\n", connectedClients));
-            sb.append(String.format("client_longest_output_list:%d\r\n", clientLongestOutputList));
-            sb.append(String.format("client_biggest_input_buf:%d\r\n", clientBiggestInputBuf));
-            sb.append(String.format("blocked_clients:%d\r\n", blockedClients));
-            sb.append(CRLF_STRING);
+                sb.append("# Stats\r\n");
+                sb.append(String.format("total_connections_received:%d\r\n", totalConnectionsReceived));
+                sb.append(String.format("total_commands_processed:%d\r\n", totalCommandsProcessed));
+                sb.append(CRLF_STRING);
 
-            sb.append("# Keyspace\r\n");
-            Set<Integer> keys = null;
-            synchronized (databases) {
-                keys = new LinkedHashSet<Integer>(databases.keySet());
+                sb.append("# Clients\r\n");
+                sb.append(String.format("connected_clients:%d\r\n", connectedClients));
+                sb.append(String.format("client_longest_output_list:%d\r\n", clientLongestOutputList));
+                sb.append(String.format("client_biggest_input_buf:%d\r\n", clientBiggestInputBuf));
+                sb.append(String.format("blocked_clients:%d\r\n", blockedClients));
+                sb.append(CRLF_STRING);
+
+                sb.append("# Keyspace\r\n");
+                Set<Integer> keys = null;
+                synchronized (databases) {
+                    keys = new LinkedHashSet<Integer>(databases.keySet());
+                }
+
+                for (Integer num : keys) {
+                    Database db = RedisServer.this.getDb(num);
+                    int count = db.size();
+                    long expires = 0;
+                    long avgTtl = 0;
+                    sb.append(String.format("db%d:keys=%d,expires=%d,avg_ttl=%d\r\n", num, count, expires, avgTtl ));
+                }
+
+                writer.sendReply(sb);
             }
-
-            for (Integer num : keys) {
-                Database db = RedisServer.this.getDb(num);
-                int count = db.size();
-                long expires = 0;
-                long avgTtl = 0;
-                sb.append(String.format("db%d:keys=%d,expires=%d,avg_ttl=%d\r\n", num, count, expires, avgTtl ));
+            finally {
+                databases.unlockReader();
             }
-
-            writer.sendReply(sb);
         }
 
         @CommandMethod(args = {"[NOSAVE|SAVE]"}, min=0, max=1, since="1.0.0")
@@ -1368,6 +1434,24 @@ public class RedisServer {
             stop();
         }
 
+        @CommandMethod(args = {}, since="2.6.0", ro=true)
+        protected void time(Database db, Args args) throws IOException {
+            long millis = now();
+            ArrayList<String> list = new ArrayList<String>();
+            list.add(Long.toString(millis/1000));
+            list.add(Long.toString(millis%1000) + "000");
+            writer.sendArray(list);
+        }
+
+        @CommandMethod(args = {}, since="1.0.0", ro=true)
+        protected void role(Database db, Args args) throws IOException {
+            ArrayList<String> list = new ArrayList<String>();
+            list.add("master");
+            list.add("0");
+            list.add(null);
+            writer.sendArray(list);
+        }
+
         @CommandMethod(args = {"key", "cursor", "[MATCH pattern]"}, min=2, since="2.8.0")
         protected void hscan(Database db, Args args) throws IOException {
             _todo("hscan");
@@ -1386,15 +1470,6 @@ public class RedisServer {
         @CommandMethod(args = {}, since="1.0.0")
         protected void sync(Database db, Args args) throws IOException {
             _todo("sync");
-        }
-
-        @CommandMethod(args = {}, since="2.6.0", ro=true)
-        protected void time(Database db, Args args) throws IOException {
-            long millis = now();
-            ArrayList<String> list = new ArrayList<String>();
-            list.add(Long.toString(millis/1000));
-            list.add(Long.toString(millis%1000) + "000");
-            writer.sendArray(list);
         }
 
         @CommandMethod(args= {"key", "bit", "value"}, since="2.2.0")
@@ -1697,15 +1772,6 @@ public class RedisServer {
             _todo("restore");
         }
 
-        @CommandMethod(args = {}, since="1.0.0", ro=true)
-        protected void role(Database db, Args args) throws IOException {
-            ArrayList<String> list = new ArrayList<String>();
-            list.add("master");
-            list.add("0");
-            list.add(null);
-            writer.sendArray(list);
-        }
-
         @CommandMethod(args = {}, since="1.0.0")
         protected void rpoplpush(Database db, Args args) throws IOException {
             _todo("rpoplpush");
@@ -1802,12 +1868,6 @@ public class RedisServer {
         @CommandMethod(args = {}, since="1.0.0")
         protected void srem(Database db, Args args) throws IOException {
             _todo("srem");
-        }
-
-        @CommandMethod(args = {}, since="1.0.0", ro=true)
-        protected void strlen(Database db, Args args) throws IOException {
-            Ageable a = db.get(args.key(), false);
-            writer.sendNumber(null==a ? 0 : ((String)a.get()).length());
         }
 
         @CommandMethod(args = {}, since="1.0.0")
@@ -2069,7 +2129,6 @@ public class RedisServer {
         protected void _todo(String cmd) throws IOException {
             writer.sendError("TODO", "Command '%s' not yet implemented", cmd);
         }
-
 
         protected void kill() {
             try {
@@ -2502,24 +2561,29 @@ public class RedisServer {
             return map;
         }
 
-        public void persist(Map<Integer, Database> databases) throws IOException {
-            synchronized (databases) {
-
-                final String info = getInfo();
+        public synchronized void persist(Databases databases) throws IOException {
+            final String info = getInfo();
+            databases.lockWriter();
+            Databases copy = null;
+            try {
                 logInfo("%s: saving %d databases", info, databases.size());
+                copy = new Databases(databases);
+            }
+            finally {
+                databases.unlockWriter();
+            }
 
-                for (Integer num : databases.keySet()) {
-                    Database db = databases.get(num);
-                    if (db.dirty) {
-                        this.persist(db);
-                    }
-                    else {
-                        logInfo("%s: database %d was not modified", info, num);
-                    }
+            Set<Integer> keys = copy.keySet();
+            for (Integer num : keys) {
+                Database db = databases.get(num);
+                if (db.dirty) {
+                    this.persist(db);
+                }
+                else {
+                    logInfo("%s: database %d was not modified", info, num);
                 }
             }
         }
-
 
         public String getInfo() {
             return getClass().getSimpleName() + "[" + redisServer.getPort() + "]";
@@ -2527,9 +2591,18 @@ public class RedisServer {
 
         public void persist(Database db) throws IOException {
 
+            db.lockReader();
+            Database copy = null;
+            try {
+                copy = new Database(db);
+            }
+            finally {
+                db.unlockReader();
+            }
+
             String info = getInfo();
 
-            int num  = db.getNumber();
+            int num  = copy.getNumber();
             File tmp  = new File(dir, String.format("db%d.tmp", num));
             File dest = getFileForDb(num);
 
@@ -2537,8 +2610,8 @@ public class RedisServer {
             RESPWriter writer = new RESPWriter(fos);
 
             int keyCount = -1;
-            synchronized (db) {
-                Set<String> keys = db.keySet();
+            synchronized (copy) {
+                Set<String> keys = copy.keySet();
                 keyCount = keys.size();
 
                 logInfo("%s: saving %d keys in db %d to %s", info, keyCount, databases.size(), tmp);
@@ -2546,7 +2619,7 @@ public class RedisServer {
 
                 for (String key : keys) {
 
-                    Ageable a = db.get(key, false);
+                    Ageable a = copy.get(key, false);
                     if (null==a) {
                         // expired right now??
                         continue;
@@ -2589,7 +2662,7 @@ public class RedisServer {
             if (check.size() != keyCount) {
 
                 Set<String> missing = new TreeSet<String>();
-                for (String key : db.keySet()) {
+                for (String key : copy.keySet()) {
                     if (!check.containsKey(key)) {
                         missing.add(key);
                     }
@@ -2627,7 +2700,7 @@ public class RedisServer {
             FileInputStream fis = new FileInputStream(file);
             RESPReader reader = new RESPReader(fis).withNonStandard(true);
 
-            Database db = new Database(num);
+            Database db = new Database(num, locking);
             boolean done = false;
             do {
                 String key = reader.readString();
@@ -2662,18 +2735,119 @@ public class RedisServer {
     }
 
 
+    class NoLock implements Lock {
+        @Override
+        public void lock() {}
+        @Override
+        public void lockInterruptibly() throws InterruptedException {}
+        @Override
+        public boolean tryLock() { return true; }
+        @Override
+        public boolean tryLock(long time, TimeUnit unit) throws InterruptedException { return true; }
+        @Override
+        public void unlock() {}
+        @Override
+        public Condition newCondition() { return null; }
+    }
+
+    class ReadWriteNoLock implements ReadWriteLock {
+
+        ReadWriteNoLock() {
+            this.lock = new NoLock();
+        }
+        @Override
+        public Lock writeLock() { return lock; }
+
+        @Override
+        public Lock readLock() { return lock; }
+
+        private NoLock lock;
+    }
+
+    @SuppressWarnings("serial")
+    class Databases extends TreeMap<Integer,Database> {
+
+        Databases(boolean locking) {
+            this.lock = locking ? new ReentrantReadWriteLock() : new ReadWriteNoLock();
+        }
+
+        public Databases(Databases databases) {
+            super(databases);
+        }
+
+        public void lockReader() {
+            lock.readLock().lock();
+        }
+
+        public void lockWriter() {
+            lock.writeLock().lock();
+        }
+
+        public void unlockReader() {
+            lock.readLock().unlock();
+        }
+
+        public void unlockWriter() {
+            lock.writeLock().unlock();
+        }
+
+        private ReadWriteLock lock;
+    }
+
     /**
      * This class represents a single Redis database.
      */
     @SuppressWarnings("serial")
     public class Database extends LinkedHashMap<String, Ageable> {
 
-        public Database(int number) {
-            this.number = number;
+        public Database(int number, boolean locking) {
+            this.number  = number;
+            this.locking = locking;
+            this.lock    = locking ? new ReentrantReadWriteLock() : new ReadWriteNoLock();
+        }
+
+        public Database(Database that) {
+            super(that);
+            this.number  = that.number;
+            this.locking = that.locking;
+            this.lock    = that.locking ? new ReentrantReadWriteLock() : new ReadWriteNoLock();
+        }
+
+        public int strlen(String key) {
+            lockReader();
+            try {
+                Ageable a = get(key, false);
+                return null==a ? 0 : ((String)a.get()).length();
+            }
+            finally {
+                unlockReader();
+            }
+        }
+
+        public void lockReader() {
+            lock.readLock().lock();
+        }
+
+        public void lockWriter() {
+            lock.writeLock().lock();
+        }
+
+        public void unlockReader() {
+            lock.readLock().unlock();
+        }
+
+        public void unlockWriter() {
+            lock.writeLock().unlock();
         }
 
         public long dbsize() {
-            return size();
+            lockReader();
+            try {
+                return size();
+            }
+            finally {
+                unlockReader();
+            }
         }
 
         public Database flushDb() {
@@ -2682,144 +2856,197 @@ public class RedisServer {
         }
 
         public void mset(List<String> args) throws IOException {
-            markDirty();
-            for (int i=0; i<args.size(); i+=2) {
-                String key = args.get(i);
-                String val = args.get(i+1);
-                put(key, new Ageable(val));
+            lockWriter();
+            try {
+                for (int i=0; i<args.size(); i+=2) {
+                    String key = args.get(i);
+                    String val = args.get(i+1);
+                    markDirty();
+                    put(key, new Ageable(val));
+                }
+            }
+            finally {
+                unlockWriter();
             }
         }
 
         public List<String> hmget(String key, Args args) {
-            Ageable a = get(key, false);
-            List<String> list = new ArrayList<String>();
-            if (null!=a) {
-                Hash hash = (Hash) a.value;
-                for (int i=1, len=args.size(); i<len; i++) {
-                    String value = hash.get(args.get(i));
-                    list.add(value);
+            lockReader();
+            try {
+                Ageable a = get(key, false);
+                List<String> list = new ArrayList<String>();
+                if (null!=a) {
+                    Hash hash = (Hash) a.value;
+                    for (int i=1, len=args.size(); i<len; i++) {
+                        String value = hash.get(args.get(i));
+                        list.add(value);
+                    }
                 }
+                return list;
             }
-            return list;
+            finally {
+                unlockReader();
+            }
         }
 
         public int llen(String key) {
-            Ageable a = get(key, false);
-            int len = 0;
-            if (null!=a) {
-                List<Object> list = a.get();
-                len = list.size();
+            lockReader();
+            try {
+                Ageable a = get(key, false);
+                int len = 0;
+                if (null!=a) {
+                    List<Object> list = a.get();
+                    len = list.size();
+                }
+                return len;
             }
-            return len;
+            finally {
+                unlockReader();
+            }
         }
 
         public List<String> mget(Args args) {
-            List<String> values = new ArrayList<String>(args.size());
-            for (String key : args) {
-                Ageable a = get(key, false);
-                if (null==a) {
-                    values.add(null);
+            lockReader();
+            try {
+                List<String> values = new ArrayList<String>(args.size());
+                for (String key : args) {
+                    Ageable a = get(key, false);
+                    if (null==a) {
+                        values.add(null);
+                    }
+                    else {
+                        String string = a.get();
+                        values.add(string);
+                    }
                 }
-                else {
-                    String string = a.get();
-                    values.add(string);
-                }
+                return values;
             }
-            return values;
+            finally {
+                unlockReader();
+            }
         }
 
         public int msetnx(List<String> args) throws IOException {
-
-            markDirty();
-            for (int i=1; i<args.size(); i+=2) {
-                String key = args.get(i);
-                Ageable a = get(key, false);
-                if (notExpired(a)) {
-                    return 0;
+            lockWriter();
+            try {
+                for (int i=1; i<args.size(); i+=2) {
+                    String key = args.get(i);
+                    Ageable a = get(key, false);
+                    if (notExpired(a)) {
+                        return 0;
+                    }
                 }
-            }
 
-            int count = 0;
-            for (int i=0; i<args.size(); i+=2) {
-                String key = args.get(i);
-                String val = args.get(i+1);
-                put(key, new Ageable(val));
-                count ++;
+                int count = 0;
+                for (int i=0; i<args.size(); i+=2) {
+                    markDirty();
+                    String key = args.get(i);
+                    String val = args.get(i+1);
+                    put(key, new Ageable(val));
+                    count ++;
+                }
+                return count;
             }
-
-            //writer.sendNumber(count);
-            return count;
+            finally {
+                unlockWriter();
+            }
         }
 
         public int psetex(String key, int millis, String value) {
-            Ageable a = get(key, false);
-            int rc = 0;
-            if (null==a) {
-                put(key, a = new Ageable(value));
-                a.expires = now()+millis;
-                rc = 1;
+            lockWriter();
+            try {
+                Ageable a = get(key, false);
+                int rc = 0;
+                if (null==a) {
+                    put(key, a = new Ageable(value));
+                    a.expires = now()+millis;
+                    rc = 1;
+                }
+                else {
+                    rc = 0;
+                }
+                return rc;
             }
-            else {
-                rc = 0;
+            finally {
+                unlockWriter();
             }
-            return rc;
         }
 
 
         public int setex(String key, int secs, String value) {
-            Ageable a = get(key, false);
-            int rc = 0;
-            if (null==a) {
-                put(key, a = new Ageable(value));
-                a.expires = now()+1000*secs;
-                rc = 1;
+            lockWriter();
+            try {
+                Ageable a = get(key, false);
+                int rc = 0;
+                if (null==a) {
+                    put(key, a = new Ageable(value));
+                    a.expires = now()+1000*secs;
+                    rc = 1;
+                }
+                else {
+                    rc = 0;
+                }
+                return rc;
             }
-            else {
-                rc = 0;
+            finally {
+                unlockWriter();
             }
-            return rc;
         }
 
         public String type(String key) {
-            String type  = null;
-            Ageable a = get(key, false);
-            if (notExpired(a)) {
-                Object value = a.value;
-                if (value instanceof String) {
-                    type = "string";
+            lockReader();
+            try {
+                String type  = null;
+                Ageable a = get(key, false);
+                if (notExpired(a)) {
+                    Object value = a.value;
+                    if (value instanceof String) {
+                        type = "string";
+                    }
+                    else if (value instanceof List) {
+                        type = "list";
+                    }
+                    else if (value instanceof Set) {
+                        type = "set";
+                    }
+                    else if (value instanceof Map) {
+                        type = "hash";
+                    }
+                    else if (value instanceof ZSet) {
+                        type = "zset";
+                    }
                 }
-                else if (value instanceof List) {
-                    type = "list";
-                }
-                else if (value instanceof Set) {
-                    type = "set";
-                }
-                else if (value instanceof Map) {
-                    type = "hash";
-                }
-                else if (value instanceof ZSet) {
-                    type = "zset";
-                }
+                return type;
             }
-            return type;
+            finally {
+                unlockReader();
+            }
         }
 
         public long append(String key, String value) {
-            Ageable a = get(key, false);
-            long len = 0;
-            if (null==a) {
-                put(key, new Ageable(value));
-                len = value.length();
+            lockWriter();
+            try {
+                Ageable a = get(key, false);
+                long len = 0;
+                if (null==a) {
+                    put(key, new Ageable(value));
+                    len = value.length();
+                }
+                else {
+                    String s = a.value.toString() + value;
+                    a.value = s;
+                    len = s.length();
+                }
+                return len;
             }
-            else {
-                String s = a.value.toString() + value;
-                a.value = s;
-                len = s.length();
+            finally {
+                unlockWriter();
             }
-            return len;
         }
 
         public double incrbyfloat(String key, double amount) {
+            lockWriter();
+            try {
             Ageable a = markDirty().get(key, false);
             if (null==a) {
                 put(key, a = new Ageable("0"));
@@ -2830,23 +3057,39 @@ public class RedisServer {
             s = l.toString();
             a.value  = s;
             return l;
+            }
+            finally {
+                unlockWriter();
+            }
         }
 
         public boolean exists(String key) {
-            Ageable a = get(key, false);
-            return null!=a;
+            lockReader();
+            try {
+                Ageable a = get(key, false);
+                return null!=a;
+            }
+            finally {
+                unlockReader();
+            }
         }
 
         public Collection<String> keys(String glob) {
-            Pattern rex = createRegexFromGlob(glob);
-            ArrayList<String> matches = new ArrayList<String>();
+            lockReader();
+            try {
+                Pattern rex = createRegexFromGlob(glob);
+                ArrayList<String> matches = new ArrayList<String>();
 
-            for (String key : keySet()) {
-                if (rex.matcher(key).matches()) {
-                    matches.add(key);
+                for (String key : keySet()) {
+                    if (rex.matcher(key).matches()) {
+                        matches.add(key);
+                    }
                 }
+                return matches;
             }
-            return matches;
+            finally {
+                unlockReader();
+            }
         }
 
         public int hset(String key, String field, String value) {
@@ -2858,38 +3101,47 @@ public class RedisServer {
         }
 
         public int bitcount(String key) throws IOException {
-
-            int count = 0;
-            Ageable a = get(key, false);
-            if (null!=a) {
-                String s = a.get();
-                for (int i=0, len=s.length(); i<len; i++) {
-                    char c = s.charAt(i);
-                    int upper = ((byte)c) >> 4;
+            lockReader();
+            try {
+                int count = 0;
+                Ageable a = get(key, false);
+                if (null!=a) {
+                    String s = a.get();
+                    for (int i=0, len=s.length(); i<len; i++) {
+                        char c = s.charAt(i);
+                        int upper = ((byte)c) >> 4;
                     int lower = ((byte)c) & 0x0f;
                     count += NIBBLE_BITS[upper] + NIBBLE_BITS[lower];
+                    }
                 }
+                return count;
             }
-            return count;
+            finally {
+                unlockReader();
+            }
         }
 
         @CommandMethod(args= {"key", "offset"}, since="2.2.0", ro=true)
         public int getbit(String key, int off) throws IOException {
-
-            //String key = args.key();
-            int value = 0;
-            Ageable a = get(key, false);
-            if (null!=a) {
-                String s = a.get();
-                //int off = Integer.parseInt(args.get(1));
-                int pos = off/8;
-                char c = (null==s || pos>=s.length()) ? 0 : s.charAt(pos);
-                byte mask = (byte)(0x80 >> (off%8));
-                if ((mask & c) > 0) {
-                    value = 1;
+            lockReader();
+            try {
+                int value = 0;
+                Ageable a = get(key, false);
+                if (null!=a) {
+                    String s = a.get();
+                    //int off = Integer.parseInt(args.get(1));
+                    int pos = off/8;
+                    char c = (null==s || pos>=s.length()) ? 0 : s.charAt(pos);
+                    byte mask = (byte)(0x80 >> (off%8));
+                    if ((mask & c) > 0) {
+                        value = 1;
+                    }
                 }
+                return value;
             }
-            return value;
+            finally {
+                unlockReader();
+            }
         }
 
         public int sadd(String key, String ... members) {
@@ -2899,18 +3151,24 @@ public class RedisServer {
 
         public int sadd(String key, Collection<String> members) {
 
-            Ageable age = get(key, false);
-            _Set    set = null;
-            if (null==age) {
-                put(key, age = new Ageable(set = new _Set(members.size())));
+            lockWriter();
+            try {
+                Ageable age = get(key, false);
+                _Set    set = null;
+                if (null==age) {
+                    put(key, age = new Ageable(set = new _Set(members.size())));
+                }
+                else {
+                    set = age.get();
+                }
+                int before = set.size();
+                set.addAll(members);
+                int after = set.size();
+                return after-before;
             }
-            else {
-                set = age.get();
+            finally {
+                unlockWriter();
             }
-            int before = set.size();
-            set.addAll(members);
-            int after = set.size();
-            return after-before;
         }
 
         public int getNumber() {
@@ -2918,15 +3176,27 @@ public class RedisServer {
         }
 
         public void set(String key, String value) {
-            put(key, new Ageable(value));
+            lockWriter();
+            try {
+                put(key, new Ageable(value));
+            }
+            finally {
+                unlockWriter();
+            }
         }
 
         public boolean setnx(String key, String value) throws IOException {
-            if (containsKey(key)) {
+            lockWriter();
+            try {
+                if (containsKey(key)) {
+                    return false;
+                }
+                markDirty().put(key, new Ageable(value));
                 return false;
             }
-            markDirty().put(key, new Ageable(value));
-            return false;
+            finally {
+                unlockWriter();
+            }
         }
 
         public Database markDirty() {
@@ -2935,8 +3205,14 @@ public class RedisServer {
         }
 
         public String get(String key) {
-            Ageable a = get(key, false);
-            return null==a ? null : (String) a.value;
+            lockReader();
+            try {
+                Ageable a = get(key, false);
+                return null==a ? null : (String) a.value;
+            }
+            finally {
+                unlockReader();
+            }
         }
 
         public Ageable get(String key, boolean returnExpired) {
@@ -2948,138 +3224,198 @@ public class RedisServer {
         }
 
         public long ttl(String key) {
-            long ttl = -2;
-            Ageable a = get(key, false);
-            if (notExpired(a)) {
-                if (a.expires<0) {
-                    ttl = -1;
+            lockReader();
+            try {
+                long ttl = -2;
+                Ageable a = get(key, false);
+                if (notExpired(a)) {
+                    if (a.expires<0) {
+                        ttl = -1;
+                    }
+                    else {
+                        ttl = (now()-a.expires)/1000;
+                    }
                 }
                 else {
-                    ttl = (now()-a.expires)/1000;
+                    ttl = -2;
                 }
+                return ttl;
             }
-            else {
-                ttl = -2;
+            finally {
+                unlockReader();
             }
-            return ttl;
         }
 
         public long pttl(String key) {
-            long ttl = -2;
-            Ageable a = get(key, false);
-            if (notExpired(a)) {
-                if (a.expires<0) {
-                    ttl = -1;
+            lockReader();
+            try {
+                long ttl = -2;
+                Ageable a = get(key, false);
+                if (notExpired(a)) {
+                    if (a.expires<0) {
+                        ttl = -1;
+                    }
+                    else {
+                        ttl = (now()-a.expires);
+                    }
                 }
                 else {
-                    ttl = (now()-a.expires);
+                    ttl = -2;
                 }
+                return ttl;
             }
-            else {
-                ttl = -2;
+            finally {
+                unlockReader();
             }
-            return ttl;
         }
 
         public int expire(String key, int secs) {
-            int rc = 0;
-            Ageable a = get(key, false);
-            if (notExpired(a)) {
-                a.expires = now()+1000*secs;
-                rc = 0;
+            lockWriter();
+            try {
+                int rc = 0;
+                Ageable a = get(key, false);
+                if (notExpired(a)) {
+                    a.expires = now()+1000*secs;
+                    rc = 0;
+                }
+                else {
+                    rc = 1;
+                }
+                return rc;
             }
-            else {
-                rc = 1;
+            finally {
+                unlockWriter();
             }
-            return rc;
         }
 
         public int hexists(String key, String field) {
-            int rc = 0;
-                Ageable a = get(key, false);
-                if (null!=a) {
-                    Hash h = (Hash) a.value;
-                    if (h.containsKey(field)) {
-                        rc = 1;
+            lockReader();
+            try {
+                int rc = 0;
+                    Ageable a = get(key, false);
+                    if (null!=a) {
+                        Hash h = (Hash) a.value;
+                        if (h.containsKey(field)) {
+                            rc = 1;
+                        }
                     }
-                }
-            return rc;
+                return rc;
+            }
+            finally {
+                unlockReader();
+            }
         }
 
         public void hmset(String key, List<String> keyVal) {
-            Ageable a = get(key, false);
-            Hash hash = null;
-            if (null==a) {
-                put(key, new Ageable(hash = new Hash()));
+            lockWriter();
+            try {
+                Ageable a = get(key, false);
+                Hash hash = null;
+                if (null==a) {
+                    put(key, new Ageable(hash = new Hash()));
+                }
+                else {
+                    hash = a.get();
+                }
+                for (int i=0, len=keyVal.size(); i<len; i+=2) {
+                    hash.put(keyVal.get(i), keyVal.get(i+1));
+                }
             }
-            else {
-                hash = a.get();
-            }
-            for (int i=0, len=keyVal.size(); i<len; i+=2) {
-                hash.put(keyVal.get(i), keyVal.get(i+1));
+            finally {
+                unlockWriter();
             }
         }
 
 
         public List<String> hkeys(String key) {
-            Ageable a = get(key, false);
-            List<String> list = new ArrayList<String>();
-            if (null!=a) {
-                Hash hash = (Hash) a.value;
-                for (String field : hash.keySet()) {
-                    list.add(field);
+            lockReader();
+            try {
+                Ageable a = get(key, false);
+                List<String> list = new ArrayList<String>();
+                if (null!=a) {
+                    Hash hash = (Hash) a.value;
+                    for (String field : hash.keySet()) {
+                        list.add(field);
+                    }
                 }
+                return list;
             }
-            return list;
+            finally {
+                unlockReader();
+            }
         }
 
         public List<String> hvals(String key) {
-            Ageable a = get(key, false);
-            List<String> list = new ArrayList<String>();
-            if (null!=a) {
-                Hash hash = (Hash) a.value;
-                for (String field : hash.values()) {
-                    list.add(field);
+            lockReader();
+            try {
+                Ageable a = get(key, false);
+                List<String> list = new ArrayList<String>();
+                if (null!=a) {
+                    Hash hash = (Hash) a.value;
+                    for (String field : hash.values()) {
+                        list.add(field);
+                    }
                 }
+                return list;
             }
-            return list;
+            finally {
+                unlockReader();
+            }
         }
 
         public int hdel(String key, Args args) {
-            Ageable a = get(key, false);
-            int count = 0;
-            if (null!=a) {
-                Hash hash = (Hash) a.value;
-                for (int i=0; i<args.size(); i++) {
-                    String field = args.get(i);
-                    if (hash.contains(field)) {
-                        hash.remove(field);
-                        count++;
+            lockWriter();
+            try {
+                Ageable a = get(key, false);
+                int count = 0;
+                if (null!=a) {
+                    Hash hash = (Hash) a.value;
+                    for (int i=0; i<args.size(); i++) {
+                        String field = args.get(i);
+                        if (hash.contains(field)) {
+                            hash.remove(field);
+                            count++;
+                        }
                     }
                 }
+                return count;
             }
-            return count;
+            finally {
+                unlockWriter();
+            }
         }
 
         public int hlen(String key) {
-            int rc = 0;
-            Ageable a = get(key, false);
-            if (null!=a) {
-                Hash hash = (Hash) a.value;
-                rc = hash.size();
+            lockReader();
+            try {
+                int rc = 0;
+                Ageable a = get(key, false);
+                if (null!=a) {
+                    Hash hash = (Hash) a.value;
+                    rc = hash.size();
+                }
+                return rc;
             }
-            return rc;
+            finally {
+                unlockReader();
+            }
         }
 
         public int hstrlen(String key, String field) throws IOException {
-            int rc = -1;
-            Ageable a = get(key, false);
-            if (null!=a) {
-                Hash hash = (Hash) a.value;
-                String value = hash.get(field);
-                rc = value.length();
+            lockReader();
+            try {
+                int rc = -1;
+                Ageable a = get(key, false);
+                if (null!=a) {
+                    Hash hash = (Hash) a.value;
+                    String value = hash.get(field);
+                    rc = value.length();
+                }
+                return rc;
             }
-            return rc;
+            finally {
+                unlockReader();
+            }
         }
 
         public List<Object> lpush(String key, String val) {
@@ -3186,118 +3522,173 @@ public class RedisServer {
         }
 
         private List<Object> _push(String key, String val, boolean left) {
+            lockWriter();
+            try {
+                markDirty();
+                Ageable a = get(key, false);
+                if (null==a) {
+                    put(key, a = new Ageable(new ArrayList<Object>()));
+                }
 
-            markDirty();
-            Ageable a = get(key, false);
-            if (null==a) {
-                put(key, a = new Ageable(new ArrayList<Object>()));
+                @SuppressWarnings("unchecked")
+                List<Object> list = (List<Object>) a.value;
+                if (left) {
+                    list.add(0, val);
+                }
+                else {
+                    list.add(val); /// at end
+                }
+                return list;
             }
-
-            @SuppressWarnings("unchecked")
-            List<Object> list = (List<Object>) a.value;
-            if (left) {
-                list.add(0, val);
+            finally {
+                unlockWriter();
             }
-            else {
-                list.add(val); /// at end
-            }
-            return list;
         }
 
         private String _pop(String key, boolean left) {
-            markDirty();
-            String item = null;
-            Ageable a = get(key, false);
-            if (null!=a) {
-                @SuppressWarnings("unchecked")
-                List<String> list = (List<String>) a.value;
-                if (list.size()>0) {
-                    if (left) {
-                        item = list.remove(0);
-                    }
-                    else {
-                        item = list.remove(list.size()-1);
+            lockWriter();
+            try {
+                markDirty();
+                String item = null;
+                Ageable a = get(key, false);
+                if (null!=a) {
+                    @SuppressWarnings("unchecked")
+                    List<String> list = (List<String>) a.value;
+                    if (list.size()>0) {
+                        if (left) {
+                            item = list.remove(0);
+                        }
+                        else {
+                            item = list.remove(list.size()-1);
+                        }
                     }
                 }
+                return item;
             }
-            return item;
+            finally {
+                unlockWriter();
+            }
         }
 
         private long _hincrBy(String key, String field, Args args) {
-            Ageable a = get(key, false);
-            Hash hash = null;
-            if (null==a) {
-                put(key, new Ageable(hash = new Hash()));
-            }
-            else {
-                hash = (Hash) a.value;
-            }
+            lockWriter();
+            try {
+                Ageable a = get(key, false);
+                Hash hash = null;
+                if (null==a) {
+                    put(key, new Ageable(hash = new Hash()));
+                }
+                else {
+                    hash = (Hash) a.value;
+                }
 
-            long incr = Long.parseLong(args.get(2));
-            String value = hash.getOrDefault(field, "0");
-            long sum = Long.parseLong(value)+incr;
-            String string = Long.toString(sum);
-            hash.put(field, string);
-            return sum;
+                long incr = Long.parseLong(args.get(2));
+                String value = hash.getOrDefault(field, "0");
+                long sum = Long.parseLong(value)+incr;
+                String string = Long.toString(sum);
+                hash.put(field, string);
+                return sum;
+            }
+            finally {
+                unlockWriter();
+            }
         }
 
-        private Long _incrDecr(String key, boolean incr, String amount) {
-            markDirty();
-            Ageable a = get(key, false);
-            if (null==a) {
-                put(key, a = new Ageable("0"));
-            }
+        protected Long decrby(String key, long amount) {
+            return _incrDecr(key, false, amount);
+        }
 
-            Long    b = (incr ? 1 : -1) * toLong(amount);
-            String  s = a.get();
-            Long    l = toLong(s)+b;
-            a.value = l.toString();;
-            return l;
+        @CommandMethod(args = {"key", "amout"}, since="1.0.0")
+        protected Long incrby(String key, long amount) {
+            return _incrDecr(key, true, amount);
+        }
+
+        @CommandMethod(args = {"key"}, since="1.0.0")
+        protected Long decr(String key) {
+            return _incrDecr(key, false, 1);
+        }
+
+        @CommandMethod(args = {"key"}, since="1.0.0")
+        protected Long incr(String key) {
+            return _incrDecr(key, true, 1);
+        }
+
+        private Long _incrDecr(String key, boolean incr, long amount) {
+            lockWriter();
+            try {
+                markDirty();
+                Ageable a = get(key, false);
+                if (null==a) {
+                    put(key, a = new Ageable("0"));
+                }
+
+                Long    b = (incr ? 1 : -1) * amount;
+                String  s = a.get();
+                Long    l = toLong(s)+b;
+                a.value = l.toString();;
+                return l;
+            }
+            finally {
+                unlockWriter();
+            }
         }
 
         private String _hincrByFloat(String key, String field, double incr) {
+            lockWriter();
+            try {
+                Ageable a = get(key, false);
+                Hash hash = null;
+                if (null==a) {
+                    put(key, new Ageable(hash = new Hash()));
+                }
+                else {
+                    hash = (Hash) a.value;
+                }
 
-            Ageable a = get(key, false);
-            Hash hash = null;
-            if (null==a) {
-                put(key, new Ageable(hash = new Hash()));
+                //double incr = Double.parseDouble(args.get(2));
+                String value = hash.getOrDefault(field, "0");
+                double sum = Double.parseDouble(value)+incr;
+                String string = Double.toString(sum);
+                hash.put(field, string);
+                return string;
             }
-            else {
-                hash = (Hash) a.value;
+            finally {
+                unlockWriter();
             }
-
-            //double incr = Double.parseDouble(args.get(2));
-            String value = hash.getOrDefault(field, "0");
-            double sum = Double.parseDouble(value)+incr;
-            String string = Double.toString(sum);
-            hash.put(field, string);
-            return string;
         }
 
         private int _hset(String key, String field, String value, boolean nx) {
-            Ageable a = get(key, false);
-            Hash hash = null;
-            if (null==a) {
-                markDirty().put(key, new Ageable(hash = new Hash()));
-            }
-            else {
-                hash = (Hash) a.value;
-            }
+            lockWriter();
+            try {
+                Ageable a = get(key, false);
+                Hash hash = null;
+                if (null==a) {
+                    markDirty().put(key, new Ageable(hash = new Hash()));
+                }
+                else {
+                    hash = (Hash) a.value;
+                }
 
-            if (nx && hash.contains(field)) {
-                return 0;
+                if (nx && hash.contains(field)) {
+                    return 0;
+                }
+                else {
+                    markDirty();
+                    hash.put(field, value);
+                    return 1;
+                }
             }
-            else {
-                markDirty();
-                hash.put(field, value);
-                return 1;
+            finally {
+                unlockWriter();
             }
         }
 
         protected int number;
         protected boolean dirty;
-    }
 
+        protected boolean locking;
+        protected ReadWriteLock lock;
+    }
 
     /**
      * This class represents a single key/value pair in a Redis database along
@@ -3535,7 +3926,10 @@ public class RedisServer {
     protected long clientBiggestInputBuf;
     protected long blockedClients;
     protected long startTime;
-    protected Map<Integer, Database> databases;
+
+    protected boolean locking;
+
+    protected Databases databases;
     protected int port;
     protected int maxDb;
     protected Persistifier persistifier;
