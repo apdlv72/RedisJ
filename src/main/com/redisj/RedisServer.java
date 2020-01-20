@@ -155,8 +155,29 @@ public class RedisServer {
             if (null!=this.persistDir) {
                 try {
                     persistifier = new Persistifier(this, persistDir);
-                    Map<Integer, Database> db = persistifier.load();
-                    databases.putAll(db);
+                    Map<Integer, Database> dbs = persistifier.load();
+
+                    StringBuilder sb = new StringBuilder();
+
+                    for (Integer num : dbs.keySet()) {
+                        Database db = dbs.get(num);
+                        try {
+                            int count = db.size();
+                            sb.append(num).append(":").append(count).append(" ");
+                        }
+                        finally {
+                            db.unlockReader();
+                        }
+                    }
+                    logInfo("RedisServer[%d]: loaded: %s", port, sb.toString());
+
+                    try {
+                        databases.lockWriter();
+                        databases.putAll(dbs);
+                    }
+                    finally {
+                        databases.unlockWriter();
+                    }
                     persistifier.start();
                 }
                 catch (Exception e) {
