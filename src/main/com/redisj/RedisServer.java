@@ -944,6 +944,7 @@ public class RedisServer {
             finally {
                 databases.unlockWriter();
             }
+            writer.write(EMPTY_BYTES);
         }
 
         @CommandMethod(args = {"pattern"}, since="1.0.0", ro=true)
@@ -1512,7 +1513,7 @@ public class RedisServer {
             _todo("bitpos");
         }
 
-        @CommandMethod(args = {}, since="1.0.0")
+        @CommandMethod(args = {"source","destination","timeout"}, since="1.0.0")
         protected void brpoplpush(Database db, Args args) throws IOException {
             _todo("brpoplpush");
         }
@@ -1607,7 +1608,7 @@ public class RedisServer {
             _todo("georadiusbymember");
         }
 
-        @CommandMethod(args = {}, since="1.0.0", ro=true)
+        @CommandMethod(args = {"key", "startOffset", "endOffset"}, since="1.0.0", ro=true)
         protected void getrange(Database db, Args args) throws IOException {
             _todo("getrange");
         }
@@ -1682,7 +1683,7 @@ public class RedisServer {
             _todo("multi");
         }
 
-        @CommandMethod(args = {}, since="1.0.0")
+        @CommandMethod(args = {"one","two"}, since="1.0.0")
         protected void object(Database db, Args args) throws IOException {
             _todo("object");
         }
@@ -1697,7 +1698,7 @@ public class RedisServer {
             _todo("pexpire");
         }
 
-        @CommandMethod(args = {}, since="1.0.0")
+        @CommandMethod(args = {"key", "millisecondsTimestamp"}, since="1.0.0")
         protected void pexpireat(Database db, Args args) throws IOException {
             _todo("pexpireat");
         }
