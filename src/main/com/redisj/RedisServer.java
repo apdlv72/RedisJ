@@ -821,8 +821,18 @@ public class RedisServer {
 
             final String METHOD = CN + ".handleRequest: ";
 
-            writer = new RESPWriter(socket);
-            reader = new RESPReader(socket);
+            writer = new RESPWriter(socket) {
+                @Override
+                protected void onError(String cause) {
+                    logError("%s", cause);
+                }
+            };
+            reader = new RESPReader(socket) {
+                @Override
+                protected void onError(String cause) {
+                    logError("%s", cause);
+                }
+            };
 
             int commands = 0;
             Args list = null;
@@ -2210,8 +2220,9 @@ public class RedisServer {
     /**
      * This class implements the reading part of the RESP protocol, @see https://redis.io/topics/protocol
      */
-    public class RESPReader {
+    public static class RESPReader {
 
+        private int localPort;
         public RESPReader(InputStream is) throws IOException {
             this.br = new BufferedReader(new InputStreamReader(is));
             this.socket = null;
@@ -2220,6 +2231,7 @@ public class RedisServer {
         public RESPReader(Socket socket) throws IOException {
             this(socket.getInputStream());
             this.socket = socket;
+            this.localPort = socket.getLocalPort();
         }
 
         public RESPReader withNonStandard(boolean b) {
@@ -2230,6 +2242,10 @@ public class RedisServer {
         public Object readStringOrList() throws IOException {
 
             String line = br.readLine();
+            if (line.startsWith("+")) {
+                return line.substring(1);
+            }
+
             int count = Integer.parseInt(line.substring(1));
             if (line.startsWith("$")) {
                 char[] cbuf = new char[count];
@@ -2270,8 +2286,13 @@ public class RedisServer {
             String line = br.readLine();
             if (null==line) {
                 SocketAddress addr = null==socket ? null :  socket.getRemoteSocketAddress();
-                logInfo("RESPReader[%d]: client disconnected %s", port, addr);
+                String cause = String.format("RESPReader[%d]: client disconnected %s", localPort, addr);
+                onError(cause);
                 return null; // EOF
+            }
+
+            if (line.startsWith("-")) {
+                throw new RESPException("Error: " + line);
             }
 
             if (!line.startsWith("*")) {
@@ -2281,6 +2302,9 @@ public class RedisServer {
             int count = Integer.parseInt(line.substring(1));
             Args list = readList(count);
             return list;
+        }
+
+        protected void onError(String cause) {
         }
 
         public Long readNumber() throws IOException {
@@ -2318,6 +2342,13 @@ public class RedisServer {
                 hash.add(value);
             }
             return hash;
+        }
+
+        protected String truncateString(String s) {
+            if (s.length()>200) s = s.substring(0,200);
+            s = s.replace("\r", "\\r");
+            s = s.replace("\n", "\\n");
+            return s;
         }
 
         protected String readString(int length) throws IOException {
@@ -2364,13 +2395,12 @@ public class RedisServer {
     /**
      * This class implements the writing part of the RESP protocol, @see https://redis.io/topics/protocol
      */
-    public class RESPWriter {
+    public static class RESPWriter {
 
         public RESPWriter(Socket socket) throws IOException {
             this(socket.getOutputStream());
             this.socket = socket;
         }
-
 
         public RESPWriter(OutputStream output) {
             this.output = output;
@@ -2468,15 +2498,20 @@ public class RedisServer {
         public void sendError(String category, String format, Object ... args) throws IOException {
 
             String formatted = String.format(format, args);
-            logError(CN + ".RESPWriter.sendError: " + formatted);
+            onError(CN + ".sendError: " + formatted);
             String line = "-" + category + " " + formatted + "\r\n";
             output.write(line.getBytes(StandardCharsets.UTF_8));
             output.flush();
         }
 
+        protected void onError(String cause) {
+        }
+
         public void close() throws IOException {
             output.close();
         }
+
+        private static final String CN = RESPWriter.class.getSimpleName();
 
         @SuppressWarnings("unused")
         private Socket socket;
@@ -2487,7 +2522,7 @@ public class RedisServer {
      * Base class for any exceptions thrown in result of a RESP protocol issue.
      */
     @SuppressWarnings("serial")
-    class RESPException extends RuntimeException {
+    static class RESPException extends RuntimeException {
         public RESPException(String msg) {
             super(msg);
         }
@@ -3748,7 +3783,7 @@ public class RedisServer {
     }
 
     @SuppressWarnings("serial")
-    class _Set extends LinkedHashSet<String>{
+    static class _Set extends LinkedHashSet<String>{
 
         public _Set(int count) {
             super(count);
@@ -3757,7 +3792,7 @@ public class RedisServer {
     }
 
     @SuppressWarnings("serial")
-    class Hash extends LinkedHashMap<String,String> {
+    static class Hash extends LinkedHashMap<String,String> {
 
         public Hash() {
             super();
@@ -3826,7 +3861,7 @@ public class RedisServer {
     }
 
     @SuppressWarnings("serial")
-    class Args extends ArrayList<String> {
+    static class Args extends ArrayList<String> {
 
         public Args(String ... strings) {
             if (null!=strings) {
