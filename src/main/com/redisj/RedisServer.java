@@ -205,9 +205,9 @@ public class RedisServer {
         }
     }
 
-    public void persist() throws IOException {
+    public void persist(boolean force) throws IOException {
         if (null!=persistifier) {
-            persistifier.persist(databases);
+            persistifier.persist(databases, force);
         }
     }
 
@@ -387,7 +387,7 @@ public class RedisServer {
         try {
             if (null!=persistifier) {
                 persistifier.interrupt();
-                persistifier.persist(databases);
+                persistifier.persist(databases, false);
             }
         } catch (IOException e) {
             e.printStackTrace();
@@ -1301,7 +1301,7 @@ public class RedisServer {
             databases.lockWriter();
             try {
                 Persistifier pers = new Persistifier(RedisServer.this, "/tmp/radisj");
-                pers.persist(databases);
+                pers.persist(databases, true);
                 writer.write(OK_BYTES);
             }
             finally {
@@ -1456,7 +1456,7 @@ public class RedisServer {
             if (null!=persistifier) {
                 try {
                     logInfo("Saving the final RDB snapshot before exiting.");
-                    persistifier.persist(databases);
+                    persistifier.persist(databases, true);
                 }
                 catch (Exception e) {
                     logError("Exception: %s", e);
@@ -2582,7 +2582,7 @@ public class RedisServer {
                 if (!stopRequested) {
                     try {
                         logInfo("%s: Persisting databases to disk", info);
-                        persist(databases);
+                        persist(databases, false);
                     }
                     catch (Exception e) {
                         e.printStackTrace();
@@ -2618,7 +2618,7 @@ public class RedisServer {
             return map;
         }
 
-        public synchronized void persist(Databases databases) throws IOException {
+        public synchronized void persist(Databases databases, boolean force) throws IOException {
             final String info = getInfo();
             databases.lockWriter();
             Databases copy = null;
@@ -2633,7 +2633,7 @@ public class RedisServer {
             Set<Integer> keys = copy.keySet();
             for (Integer num : keys) {
                 Database db = databases.get(num);
-                if (db.dirty) {
+                if (force || db.dirty) {
                     this.persist(db);
                 }
                 else {
